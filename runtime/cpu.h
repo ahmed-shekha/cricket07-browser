@@ -34,7 +34,18 @@ typedef struct CPU {
     uint64_t mm[8];   /* MMX registers (kept separate from the x87 stack; code issues EMMS between uses) */
     uint32_t mxcsr;
     uint32_t fs_base; /* guest address of the thread information block (fs:[0] = SEH chain) */
+    uint32_t preempt_ticks;   /* deterministic scheduling: function entries since this thread last yielded */
 } CPU;
+
+/* Register cache used by recompiled functions: the general registers and arithmetic flags live in a local
+   Regs while a function runs and are written back to the CPU only where other code can see them (calls,
+   returns, traps; see the translator). A local never aliases guest memory, so the compiler keeps these
+   values in machine registers instead of reloading them after every guest store. */
+typedef struct Regs {
+    uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
+    uint8_t cf, zf, sf, of, pf_byte;
+} Regs;
+#define RC_INLINE static inline __attribute__((always_inline))
 
 /* ------------------------------------------------------------------ guest memory */
 
@@ -70,61 +81,64 @@ static inline void guest_unlock(void) { __atomic_clear(&g_guest_lock, __ATOMIC_R
 
 static inline void PUSH32(CPU *c, uint32_t v) { c->esp -= 4; W32(c->esp, v); }
 static inline uint32_t POP32(CPU *c) { uint32_t v = R32(c->esp); c->esp += 4; return v; }
+RC_INLINE void PUSH32r(Regs *c, uint32_t v) { c->esp -= 4; W32(c->esp, v); }
+RC_INLINE uint32_t POP32r(Regs *c) { uint32_t v = R32(c->esp); c->esp += 4; return v; }
 
 /* ------------------------------------------------------------------ flags */
 
 static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
+RC_INLINE int PFr(const Regs *c) { return !__builtin_parity(c->pf_byte); }
 
-#define DEF_FLAGS(BITS, T, ST)                                                                     \
-    static inline T add##BITS(CPU *c, T a, T b) {                                                  \
+#define DEF_FLAGS(BITS, T, ST, S, X)                                                               \
+    static inline T add##BITS##X(S *c, T a, T b) {                                                 \
         T r = (T)(a + b);                                                                          \
         c->cf = r < a; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                 \
         c->of = (((a ^ r) & (b ^ r)) >> (BITS - 1)) & 1;                                           \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T adc##BITS(CPU *c, T a, T b) {                                                  \
+    static inline T adc##BITS##X(S *c, T a, T b) {                                                 \
         unsigned cin = c->cf;                                                                      \
         T r = (T)(a + b + cin);                                                                    \
         c->cf = cin ? r <= a : r < a; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;  \
         c->of = (((a ^ r) & (b ^ r)) >> (BITS - 1)) & 1;                                           \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T sub##BITS(CPU *c, T a, T b) {                                                  \
+    static inline T sub##BITS##X(S *c, T a, T b) {                                                 \
         T r = (T)(a - b);                                                                          \
         c->cf = a < b; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                 \
         c->of = (((a ^ b) & (a ^ r)) >> (BITS - 1)) & 1;                                           \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T sbb##BITS(CPU *c, T a, T b) {                                                  \
+    static inline T sbb##BITS##X(S *c, T a, T b) {                                                 \
         unsigned cin = c->cf;                                                                      \
         T r = (T)(a - b - cin);                                                                    \
         c->cf = cin ? a <= b : a < b; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;  \
         c->of = (((a ^ b) & (a ^ r)) >> (BITS - 1)) & 1;                                           \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T logic##BITS(CPU *c, T r) {                                                     \
+    static inline T logic##BITS##X(S *c, T r) {                                                    \
         c->cf = 0; c->of = 0; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;          \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T inc##BITS(CPU *c, T a) { /* CF preserved */                                    \
+    static inline T inc##BITS##X(S *c, T a) { /* CF preserved */                                   \
         T r = (T)(a + 1);                                                                          \
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                                \
         c->of = r == (T)((T)1 << (BITS - 1));                                                      \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T dec##BITS(CPU *c, T a) {                                                       \
+    static inline T dec##BITS##X(S *c, T a) {                                                      \
         T r = (T)(a - 1);                                                                          \
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                                \
         c->of = a == (T)((T)1 << (BITS - 1));                                                      \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T neg##BITS(CPU *c, T a) {                                                       \
+    static inline T neg##BITS##X(S *c, T a) {                                                      \
         T r = (T)(0 - a);                                                                          \
         c->cf = a != 0; c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r;                \
         c->of = a == (T)((T)1 << (BITS - 1));                                                      \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T shl##BITS(CPU *c, T a, unsigned n) {                                           \
+    static inline T shl##BITS##X(S *c, T a, unsigned n) {                                          \
         n &= 31; if (!n) return a;                                                                 \
         T r = n >= BITS ? 0 : (T)(a << n);                                                         \
         c->cf = n <= BITS ? (a >> (BITS - n)) & 1 : 0;                                             \
@@ -132,7 +146,7 @@ static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
         c->of = ((r >> (BITS - 1)) & 1) ^ c->cf;                                                   \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T shr##BITS(CPU *c, T a, unsigned n) {                                           \
+    static inline T shr##BITS##X(S *c, T a, unsigned n) {                                          \
         n &= 31; if (!n) return a;                                                                 \
         T r = n >= BITS ? 0 : (T)(a >> n);                                                         \
         c->cf = n <= BITS ? (a >> (n - 1)) & 1 : 0;                                                \
@@ -140,7 +154,7 @@ static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
         c->of = (a >> (BITS - 1)) & 1;                                                             \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T sar##BITS(CPU *c, T a, unsigned n) {                                           \
+    static inline T sar##BITS##X(S *c, T a, unsigned n) {                                          \
         n &= 31; if (!n) return a;                                                                 \
         ST s = (ST)a;                                                                              \
         T r = (T)(n >= BITS ? (s < 0 ? -1 : 0) : (s >> n));                                        \
@@ -148,14 +162,14 @@ static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
         c->zf = r == 0; c->sf = (ST)r < 0; c->pf_byte = (uint8_t)r; c->of = 0;                     \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T rol##BITS(CPU *c, T a, unsigned n) {                                           \
+    static inline T rol##BITS##X(S *c, T a, unsigned n) {                                          \
         n &= 31; if (!n) return a;                                                                 \
         n %= BITS;                                                                                 \
         T r = n ? (T)((a << n) | (a >> (BITS - n))) : a;                                           \
         c->cf = r & 1; c->of = ((r >> (BITS - 1)) & 1) ^ c->cf;                                    \
         return r;                                                                                  \
     }                                                                                              \
-    static inline T ror##BITS(CPU *c, T a, unsigned n) {                                           \
+    static inline T ror##BITS##X(S *c, T a, unsigned n) {                                          \
         n &= 31; if (!n) return a;                                                                 \
         n %= BITS;                                                                                 \
         T r = n ? (T)((a >> n) | (a << (BITS - n))) : a;                                           \
@@ -163,15 +177,15 @@ static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
         return r;                                                                                  \
     }
 
-#define DEF_RC(BITS, T)                                                                            \
-    static inline T rcl##BITS(CPU *c, T a, unsigned n) {                                           \
+#define DEF_RC(BITS, T, S, X)                                                                      \
+    static inline T rcl##BITS##X(S *c, T a, unsigned n) {                                          \
         n = (n & 31) % (BITS + 1);                                                                 \
         for (unsigned i = 0; i < n; i++) { unsigned out = (a >> (BITS - 1)) & 1;                   \
             a = (T)((a << 1) | c->cf); c->cf = out; }                                              \
         if (n == 1) c->of = ((a >> (BITS - 1)) & 1) ^ c->cf;                                       \
         return a;                                                                                  \
     }                                                                                              \
-    static inline T rcr##BITS(CPU *c, T a, unsigned n) {                                           \
+    static inline T rcr##BITS##X(S *c, T a, unsigned n) {                                          \
         n = (n & 31) % (BITS + 1);                                                                 \
         if (n == 1) c->of = ((a >> (BITS - 1)) & 1) ^ c->cf;                                       \
         for (unsigned i = 0; i < n; i++) { unsigned out = a & 1;                                   \
@@ -179,12 +193,19 @@ static inline int PF(const CPU *c) { return !__builtin_parity(c->pf_byte); }
         return a;                                                                                  \
     }
 
-DEF_FLAGS(8, uint8_t, int8_t)
-DEF_FLAGS(16, uint16_t, int16_t)
-DEF_FLAGS(32, uint32_t, int32_t)
-DEF_RC(8, uint8_t)
-DEF_RC(16, uint16_t)
-DEF_RC(32, uint32_t)
+/* add32(CPU *, ...) for the runtime and interpreter, add32r(Regs *, ...) for recompiled code */
+DEF_FLAGS(8, uint8_t, int8_t, CPU, )
+DEF_FLAGS(16, uint16_t, int16_t, CPU, )
+DEF_FLAGS(32, uint32_t, int32_t, CPU, )
+DEF_RC(8, uint8_t, CPU, )
+DEF_RC(16, uint16_t, CPU, )
+DEF_RC(32, uint32_t, CPU, )
+DEF_FLAGS(8, uint8_t, int8_t, Regs, r)
+DEF_FLAGS(16, uint16_t, int16_t, Regs, r)
+DEF_FLAGS(32, uint32_t, int32_t, Regs, r)
+DEF_RC(8, uint8_t, Regs, r)
+DEF_RC(16, uint16_t, Regs, r)
+DEF_RC(32, uint32_t, Regs, r)
 
 /* ------------------------------------------------------------------ x87 stack */
 
@@ -204,6 +225,11 @@ static inline void FCOMI(CPU *c, double a, double b) {
     if (a != a || b != b) { c->zf = 1; c->pf_byte = 0; c->cf = 1; }
     else { c->zf = a == b; c->pf_byte = 1; c->cf = a < b; }
 }
+RC_INLINE void FCOMIr(Regs *c, double a, double b) {
+    c->of = 0; c->sf = 0;
+    if (a != a || b != b) { c->zf = 1; c->pf_byte = 0; c->cf = 1; }
+    else { c->zf = a == b; c->pf_byte = 1; c->cf = a < b; }
+}
 static inline uint16_t FNSTSW(CPU *c) { return (uint16_t)((c->fpu_sw & ~0x3800) | ((c->top & 7) << 11)); }
 /* Precision control (FPU CW bits 8-9). Direct3D 8 switches the FPU to 24-bit precision unless the
    device is created with D3DCREATE_FPU_PRESERVE, so honouring it matters for matching the game. */
@@ -214,8 +240,53 @@ static inline double FDIV(CPU *c, double a, double b) {
     return a / b;
 }
 /* fsin/fcos: out-of-range arguments (|x| >= 2^63) are left unchanged with C2 set, as on hardware */
-#define FTRIG(c, v, fn) (fabs(v) >= 9223372036854775808.0 ? ((c)->fpu_sw |= 0x0400, (v)) \
+#define FTRIG(c, v, fn) (fabs(v) >= 9223372036854775808.0 ? ((c)->fpu_sw |= 0x0400, (v))           \
                                                          : ((c)->fpu_sw &= ~0x0400, fn(v)))
+/* The x87 state as recompiled functions cache it (see Regs): s[i] is ST(i), so a push or pop rotates the
+   array. Every index is a constant, so the compiler keeps the eight values in registers and a rotation costs
+   nothing. The control word is written through to the CPU (fpu_to_int32 and friends read it there). */
+typedef struct X87 { double s[8]; int top; uint16_t sw, cw; } X87;
+#define X87_LOAD(x, c) do {                                                                        \
+        (x)->top = (c)->top & 7; (x)->sw = (c)->fpu_sw; (x)->cw = (c)->fpu_cw;                     \
+        (x)->s[0] = (c)->st[(x)->top]; (x)->s[1] = (c)->st[((x)->top + 1) & 7];                    \
+        (x)->s[2] = (c)->st[((x)->top + 2) & 7]; (x)->s[3] = (c)->st[((x)->top + 3) & 7];          \
+        (x)->s[4] = (c)->st[((x)->top + 4) & 7]; (x)->s[5] = (c)->st[((x)->top + 5) & 7];          \
+        (x)->s[6] = (c)->st[((x)->top + 6) & 7]; (x)->s[7] = (c)->st[((x)->top + 7) & 7];          \
+    } while (0)
+#define X87_STORE(x, c) do {                                                                       \
+        (c)->top = (x)->top; (c)->fpu_sw = (x)->sw;                                                \
+        (c)->st[(x)->top] = (x)->s[0]; (c)->st[((x)->top + 1) & 7] = (x)->s[1];                    \
+        (c)->st[((x)->top + 2) & 7] = (x)->s[2]; (c)->st[((x)->top + 3) & 7] = (x)->s[3];          \
+        (c)->st[((x)->top + 4) & 7] = (x)->s[4]; (c)->st[((x)->top + 5) & 7] = (x)->s[5];          \
+        (c)->st[((x)->top + 6) & 7] = (x)->s[6]; (c)->st[((x)->top + 7) & 7] = (x)->s[7];          \
+    } while (0)
+RC_INLINE void FPUSHx(X87 *x, double v) {
+    x->s[7] = x->s[6]; x->s[6] = x->s[5]; x->s[5] = x->s[4]; x->s[4] = x->s[3];
+    x->s[3] = x->s[2]; x->s[2] = x->s[1]; x->s[1] = x->s[0]; x->s[0] = v;
+    x->top = (x->top - 1) & 7;
+}
+RC_INLINE double FPOPx(X87 *x) {   /* the popped value stays in its physical register, now ST(7) */
+    double v = x->s[0];
+    x->s[0] = x->s[1]; x->s[1] = x->s[2]; x->s[2] = x->s[3]; x->s[3] = x->s[4];
+    x->s[4] = x->s[5]; x->s[5] = x->s[6]; x->s[6] = x->s[7]; x->s[7] = v;
+    x->top = (x->top + 1) & 7;
+    return v;
+}
+RC_INLINE void FCOMx(X87 *x, double a, double b) {
+    uint16_t sw = x->sw & ~0x4500;
+    if (a != a || b != b) sw |= 0x4500;
+    else if (a < b) sw |= 0x0100;
+    else if (a == b) sw |= 0x4000;
+    x->sw = sw;
+}
+RC_INLINE uint16_t FNSTSWx(const X87 *x) { return (uint16_t)((x->sw & ~0x3800) | ((x->top & 7) << 11)); }
+RC_INLINE double FPRESx(const X87 *x, double v) { return ((x->cw >> 8) & 3) == 0 ? (double)(float)v : v; }
+RC_INLINE double FDIVx(X87 *x, double a, double b) {
+    if (b == 0 && a == a) x->sw |= (a == 0) ? 0x0001 : 0x0004;
+    return a / b;
+}
+#define FTRIGx(x, v, fn) (fabs(v) >= 9223372036854775808.0 ? ((x)->sw |= 0x0400, (v)) \
+                                                         : ((x)->sw &= ~0x0400, fn(v)))
 double RF80(uint32_t a);            /* load an 80-bit extended value */
 void WF80(uint32_t a, double v);    /* store as 80-bit extended */
 int32_t fpu_to_int32(CPU *c, double v);  /* honours the rounding mode in fpu_cw */
@@ -229,6 +300,15 @@ void fpu_sync_rounding(CPU *c);
 /* ------------------------------------------------------------------ CPU identification */
 void cpuid(CPU *c);   /* reports a plain Pentium-class CPU: no MMX/SSE/3DNow!, so the game takes x87 paths */
 void rdtsc(CPU *c);
+
+/* Deterministic preemption: with the deterministic scheduler on, every recompiled function entry counts
+   toward a quantum, after which the thread yields. The count depends only on the thread's own execution,
+   so preemption points are the same in every run, and threads that spin on memory another thread writes
+   (no Windows call in the loop) still let it run. */
+extern int g_preempt_on;
+void guest_preempt(CPU *c);
+#define PREEMPT_QUANTUM 100000u
+#define PREEMPT_POLL(c) do { if (__builtin_expect(g_preempt_on, 0) && ++(c)->preempt_ticks >= PREEMPT_QUANTUM) guest_preempt(c); } while (0)
 
 /* ------------------------------------------------------------------ dispatch */
 

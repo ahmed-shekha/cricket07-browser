@@ -1,7 +1,7 @@
 # Cricket 07 in the browser
 
-EA Sports Cricket 07 (2006, Windows) running in a browser tab. This repo has no game files and no
-game code, so you need your own copy of the game.
+EA Sports Cricket 07 (2006, Windows) running in a browser tab, with game controllers and online 1v1
+multiplayer. This repo has no game files and no game code, so you need your own copy of the game.
 
 ## How it was made
 
@@ -11,8 +11,13 @@ instructions. That C is compiled to WebAssembly with Emscripten, or to a native 
 
 The translated game still expects Windows, so `host/` provides the parts it uses. Direct3D 8 is
 rebuilt on WebGPU, DirectSound plays through Web Audio, DirectInput reads browser keyboard and mouse
-events, and file, thread and timer calls map onto their browser equivalents. In the browser, the game
-files live in the browser's private storage, copied in once from a folder you pick.
+events and gamepads, and file, thread and timer calls map onto their browser equivalents. In the
+browser, the game files live in the browser's private storage, copied in once from a folder you pick.
+
+Online play works without any changes to the game: both players run the same simulation, and only
+their controller inputs travel between them. The deterministic scheduler and lockstep netplay were
+ported from [Stephan Cilliers](https://github.com/stephancill)' Rugby 06 browser port, and Stephan also
+wrote the controller support.
 
 ## Using this repo
 
@@ -35,10 +40,15 @@ build/recomp /path/to/game-folder
 # 4. Build the browser version and serve it
 PROFILE=work/profile.h ./build_web.sh
 python3 web/serve.py                  # open http://localhost:8007/ and pick your game folder
+
+# 5. Optional, for online play: deploy the room server (see server/README.md)
+cd server && npx wrangler deploy && npx wrangler secret put NETPLAY_SECRET
+# then open the page with ?netplay=https://cricket07-netplay.<your-subdomain>.workers.dev
 ```
 
-Controls: arrow keys to move, **S** to select, mouse for the cursor. Use `RC_NO_AUDIO=1` to mute the
-native app, or `?mute` on the page.
+Controls: a game controller, or the keyboard (arrow keys to move, **S** to select, mouse for the
+cursor). Use `RC_NO_AUDIO=1` to mute the native app, or `?mute` on the page. Both players in an online
+match need the same build and the same game files.
 
 ## Technical notes
 
@@ -61,6 +71,12 @@ native app, or `?mute` on the page.
   the clock starts near zero instead.
 - **A tight lock/unlock loop in the sound code starved the timer thread** in the browser. Releasing a
   mutex now hands it straight to a waiting thread.
+- **Online play is lockstep.** A deterministic scheduler (`host/sched.c`) runs one game thread at a
+  time on a virtual clock, so a match depends only on its inputs. Each frame, both games wait for both
+  players' inputs and apply them together (`host/netplay.c`), and they compare a hash of the game's
+  memory every few frames to catch any drift.
+- **Recompiled functions keep registers in local variables** and write them back only around calls,
+  which made the build about 30% faster and the WebAssembly file about a quarter smaller.
 - **Translation is tested against the original.** `tests/difftest.py` runs each function in a CPU
   emulator and in translated form on the same random inputs, then compares every register and every
   byte of memory touched.

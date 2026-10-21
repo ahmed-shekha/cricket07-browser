@@ -14,7 +14,20 @@
 void dinput_key(uint8_t dik, int down);
 void dinput_mouse_button(int b, int down);
 void dinput_mouse_move(int dx, int dy);
-EXPORT void input_mouse_move(int dx, int dy) { dinput_mouse_move(dx, dy); }
+/* Netplay (netplay.c): only pads are shared between peers, so keyboard and mouse don't reach the game
+   (one peer's keys would desync the others); the page maps the keyboard onto the local pad instead. */
+int netplay_on(void);
+int netplay_local_pad(int idx, int connected, uint32_t buttons, const int32_t axis[4]);
+EXPORT void input_mouse_move(int dx, int dy) { if (!netplay_on()) dinput_mouse_move(dx, dy); }
+/* Gamepads, in the W3C "standard gamepad" layout (both SDL's GameController and the browser's Gamepad API
+   map onto it): buttons bit 0-16 = A B X Y, LB RB, LT RT (digital), Back Start, L3 R3, d-pad up down left
+   right, Guide; axes -32768..32767 (left x/y, right x/y; +y = down). */
+void dinput_pad(int idx, int connected, uint32_t std_buttons, const int32_t axis[4]);
+EXPORT void input_gamepad(int idx, int connected, uint32_t buttons, int lx, int ly, int rx, int ry) {
+    const int32_t axis[4] = { lx, ly, rx, ry };
+    if (netplay_local_pad(idx, connected, buttons, axis)) return;
+    dinput_pad(idx, connected, buttons, axis);
+}
 
 typedef struct { int usage; uint8_t dik, vk; } KeyMap;
 static const KeyMap g_keymap[] = {
@@ -118,6 +131,7 @@ static const KeyMap g_keymap[] = {
 };
 
 static void key_event_dik(uint8_t dik, int down) {
+    if (netplay_on()) return;
     for (size_t i = 0; i < sizeof g_keymap / sizeof g_keymap[0]; i++) {
         if (g_keymap[i].dik != dik) continue;
         dinput_key(dik, down);
@@ -127,8 +141,9 @@ static void key_event_dik(uint8_t dik, int down) {
     }
 }
 
-EXPORT void input_key_hid(int usage, int down) {
-    LOG("[key] usage %d %s\n", usage, down ? "down" : "up");
+/* A key the lockstep applies on every peer alike (netplay.c carries Esc with the pad inputs): not
+   guarded like the physical keyboard below, which would desync. */
+void input_key_usage_sync(int usage, int down) {
     for (size_t i = 0; i < sizeof g_keymap / sizeof g_keymap[0]; i++) {
         if (g_keymap[i].usage != usage) continue;
         dinput_key(g_keymap[i].dik, down);
@@ -138,8 +153,15 @@ EXPORT void input_key_hid(int usage, int down) {
     }
 }
 
+EXPORT void input_key_hid(int usage, int down) {
+    LOG("[key] usage %d %s\n", usage, down ? "down" : "up");
+    if (netplay_on()) return;   /* online, the keyboard only drives the pad (web/loader.js) */
+    input_key_usage_sync(usage, down);
+}
+
 EXPORT void input_mouse_button(int b, int down) {
     static const uint8_t vk[3] = { 0x01, 0x02, 0x04 };  /* VK_LBUTTON, VK_RBUTTON, VK_MBUTTON */
+    if (netplay_on()) return;
     dinput_mouse_button(b, down);
     g_keys[vk[b]] = (uint8_t)down;
     static const uint32_t msg_down[3] = { 0x201, 0x204, 0x207 };
@@ -147,17 +169,23 @@ EXPORT void input_mouse_button(int b, int down) {
 }
 
 /* Scripted input for automated testing, driven by the game's frame counter:
-   RC_INPUT="500:click,700:key=1c,900:key=c8,950:move=-75:-180" (DIK codes in hex; a key or click is held
-   4 frames; move is relative mouse motion). */
+   RC_INPUT="500:click,700:key=1c,900:key=c8,950:move=-75:-180,990:pad=1,1200:stick=0:-32768"
+   (DIK codes in hex; a key, click or pad press is held 4 frames; move is relative mouse motion; pad=<hex>[/frames]
+   presses standard-gamepad buttons on pad 0, e.g. 1 = A, 2000 = d-pad down; stick=lx:ly sets the left
+   stick until changed). */
 void input_script_tick(uint32_t frame) {
     static const char *script = (const char *)1;
     static struct { uint32_t frame; int kind; uint8_t code; } pending[64];
     static int npending;
+    static uint32_t pad_buttons;
+    static int pad_lx, pad_ly;
     if (script == (const char *)1) script = getenv("RC_INPUT");
     if (!script) return;
     for (int i = 0; i < npending; i++)
         if (pending[i].frame == frame) {
-            if (pending[i].kind == 0) input_mouse_button(0, 0); else key_event_dik(pending[i].code, 0);
+            if (pending[i].kind == 0) input_mouse_button(0, 0);
+            else if (pending[i].kind == 2) { pad_buttons = 0; input_gamepad(0, 1, 0, pad_lx, pad_ly, 0, 0); }
+            else key_event_dik(pending[i].code, 0);
             pending[i] = pending[--npending]; i--;
         }
     char tmp[16];
@@ -178,6 +206,17 @@ void input_script_tick(uint32_t frame) {
             fprintf(stderr, "[input] frame %u: key %02x\n", frame, code);
             key_event_dik(code, 1);
             if (npending < 64) pending[npending++] = (typeof(pending[0])){ frame + 4, 1, code };
+        } else if (!strncmp(a, "pad=", 4)) {
+            pad_buttons = (uint32_t)strtoul(a + 4, (char **)&a, 16);
+            uint32_t hold = *a == '/' ? (uint32_t)strtoul(a + 1, NULL, 10) : 4;   /* pad=<hex>/<frames> */
+            fprintf(stderr, "[input] frame %u: pad %x for %u frames\n", frame, pad_buttons, hold);
+            input_gamepad(0, 1, pad_buttons, pad_lx, pad_ly, 0, 0);
+            if (!hold) { pad_buttons = 0; input_gamepad(0, 1, 0, pad_lx, pad_ly, 0, 0); }   /* /0: released before the frame samples it */
+            else if (npending < 64) pending[npending++] = (typeof(pending[0])){ frame + hold, 2, 0 };
+        } else if (!strncmp(a, "stick=", 6)) {
+            pad_lx = (int)strtol(a + 6, (char **)&a, 10); pad_ly = *a == ':' ? (int)strtol(a + 1, NULL, 10) : 0;
+            fprintf(stderr, "[input] frame %u: stick %d,%d\n", frame, pad_lx, pad_ly);
+            input_gamepad(0, 1, pad_buttons, pad_lx, pad_ly, 0, 0);
         }
     }
 }

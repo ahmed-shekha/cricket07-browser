@@ -6,3 +6,6 @@
 void web_queue_chunk(uint8_t *buf, size_t len, int ends_frame) { (void)len; (void)ends_frame; free(buf); }
 int web_queued_frames(void) { return 0; }
 int web_gpu_ready(void) { return 1; }
+int g_gpu_bc;
+size_t g_gpu_tex_bytes;
+uint32_t g_gpu_bind_groups_made;

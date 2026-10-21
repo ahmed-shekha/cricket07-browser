@@ -33,6 +33,7 @@ extern char g_trap_msg[256];
 typedef struct { const char *name; GuestFn fn; } ImportHandler;  /* name like "KERNEL32.DLL!GetTickCount" */
 typedef struct { uint32_t image_base, entry, num_imports; } LoadedImage;
 extern uint32_t g_image_lo, g_image_hi;   /* the loaded executable's address range */
+extern uint32_t g_state_lo, g_state_hi;   /* its writable sections (global data): what determinism checks hash */
 
 void runtime_init(CPU *c);
 void set_import_handlers(ImportHandler *h, uint32_t n);  /* call before load_image */

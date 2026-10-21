@@ -14,3 +14,7 @@ __pycache__/
 functions.json
 ghidra_project/
 *.csv
+.dev.vars
+.wrangler/
+node_modules/
+.claude/

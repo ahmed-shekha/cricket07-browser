@@ -11,6 +11,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -36,6 +37,192 @@ COND = {
 
 class Unsupported(Exception):
     pass
+
+
+# ------------------------------------------------------------ register cache
+# Instructions are first translated against the CPU struct (c->eax, add32(c, ...), ST(0), c->xmm[1]). A
+# recompiled function then keeps the general registers, arithmetic flags, x87 stack and SSE/MMX registers it
+# uses in locals instead (Regs and X87 in runtime/cpu.h): guest stores go through a char pointer that may
+# alias anything, so values kept in the CPU struct had to be reloaded after every store, and every flag a
+# helper computed had to be stored. The locals never escape, so the C compiler keeps them in machine
+# registers and drops flags nobody reads. Their values go back to the CPU only where other code can see
+# them: before a call (then everything is reloaded, since the callee may change any of it), before a
+# return, and before a trap. A forward dataflow over the function finds which values may have changed
+# since the last write-back, so only those are stored.
+CACHED = GP32 + ["cf", "zf", "sf", "of", "pf_byte"]
+CBIT = {n: 1 << i for i, n in enumerate(CACHED)}
+FLAG_BITS = CBIT["cf"] | CBIT["zf"] | CBIT["sf"] | CBIT["of"] | CBIT["pf_byte"]
+X87_BIT = 1 << len(CACHED)
+XMM_BIT = [1 << (len(CACHED) + 1 + k) for k in range(8)]
+MM_BIT = [1 << (len(CACHED) + 9 + k) for k in range(8)]
+
+_ASSIGN = r"\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)"
+_FLAG_HELPERS = r"(?:add|adc|sub|sbb|logic|inc|dec|neg|shl|shr|sar|rol|ror|rcl|rcr)(?:8|16|32)"
+_REWRITES = [
+    (re.compile(r"\bc->(" + "|".join(CACHED) + r")\b"), r"r->\1"),
+    (re.compile(r"\b(" + _FLAG_HELPERS + r")\(c,"), r"\1r(r,"),
+    (re.compile(r"\bPUSH32\(c,"), "PUSH32r(r,"),
+    (re.compile(r"\bPOP32\(c\)"), "POP32r(r)"),
+    (re.compile(r"\bPF\(c\)"), "PFr(r)"),
+    (re.compile(r"\bFCOMI\(c,"), "FCOMIr(r,"),
+    (re.compile(r"&c->mm\[(\d)\]"), r"&M_[\1]"),
+    (re.compile(r"\bc->xmm\[(\d)\]"), r"V_[\1]"),
+]
+# x87 (statements that move the stack top directly, finit/fincstp/fdecstp, run on the CPU struct instead)
+_X87_REWRITES = [
+    (re.compile(r"\bST\((\d)\)"), r"x->s[\1]"),
+    (re.compile(r"\b(FPUSH|FCOM|FPRES|FDIV|FTRIG)\(c,"), r"\1x(x,"),
+    (re.compile(r"\b(FPOP|FNSTSW)\(c\)"), r"\1x(x)"),
+    (re.compile(r"\bc->fpu_sw\b"), "x->sw"),
+    (re.compile(r"\bc->fpu_cw = "), "x->cw = C->fpu_cw = "),   # written through (fldcw)
+    (re.compile(r"\bc->fpu_cw\b"), "x->cw"),
+    (re.compile(r"\bC->fpu_cw\b"), "c->fpu_cw"),
+]
+# calls that see the whole CPU: write back before them; after an ordinary call, reload everything
+_SYNC_CALL = re.compile(r"\b(f_[0-9a-f]{8}|call_indirect|jump_indirect|guest_trap|cpuid|rdtsc|trace_insn)"
+                        r"\(c\b[^;]*\);(\s*return;)?")
+_RETURN = re.compile(r"\breturn;")
+_WRITES = [   # (pattern, bits, or a function of the match giving the bits)
+    (re.compile(r"\br->(\w+)" + _ASSIGN + r"|\br->(\w+)\s*(?:\+\+|--)|(?:\+\+|--)\s*r->(\w+)"),
+     lambda m: CBIT[m.group(1) or m.group(2) or m.group(3)]),
+    (re.compile(r"\b" + _FLAG_HELPERS + r"r\(r,|\bFCOMIr\(r,"), FLAG_BITS),
+    (re.compile(r"\bPUSH32r\(r,|\bPOP32r\(r\)"), CBIT["esp"]),
+    (re.compile(r"\bx->(?:s\[\d\]|top|sw)" + _ASSIGN + r"|\b(?:FPUSHx|FPOPx|FCOMx|FDIVx|FTRIGx)\(x"), X87_BIT),
+    (re.compile(r"\bV_\[(\d)\](?:\.\w+(?:\[\d+\])?)?" + _ASSIGN + r"|\bmem(?:cpy|set)\((?:\(uint8_t \*\))?V_\[(\d)\]"),
+     lambda m: XMM_BIT[int(m.group(1) or m.group(2))]),
+    (re.compile(r"\bmem(?:cpy|set)\((?:\(uint8_t \*\))?&M_\[(\d)\]"), lambda m: MM_BIT[int(m.group(1))]),
+]
+# helpers that receive the CPU but read only state that stays there (the control word, written through)
+_CPU_ONLY = {"fpu_to_int32", "fpu_to_int64", "fpu_round", "fpu_sync_rounding"}
+_GOTO = re.compile(r"goto L_([0-9a-f]{8});")
+
+
+class RegisterCache:
+    """Rewrites one function's translated statements [(insn or None, text)] to use the cached state and
+    adds the loads, write-backs and reloads around them."""
+
+    def __init__(self, body):
+        self.body = body
+        self.x87_sync = []
+        texts = []
+        for _, stmt in body:
+            for rx, rep in _REWRITES:
+                stmt = rx.sub(rep, stmt)
+            sync = "c->top" in stmt
+            if not sync:
+                for rx, rep in _X87_REWRITES:
+                    stmt = rx.sub(rep, stmt)
+            self.x87_sync.append(sync)
+            for m in re.finditer(r"\b(\w+)\(c[,)]", stmt):
+                if m.group(1) not in _CPU_ONLY and not _SYNC_CALL.match(stmt, m.start()):
+                    raise RuntimeError(f"register cache: unhandled call {m.group(1)}(c) in: {stmt}")
+            texts.append(stmt)
+        self.texts = texts
+        joined = "\n".join(texts)
+        self.x87 = bool(re.search(r"\bx->|\(x[,)]", joined)) or any(self.x87_sync)
+        self.xmm = sorted({int(k) for k in re.findall(r"\bV_\[(\d)\]", joined)})
+        self.mm = sorted({int(k) for k in re.findall(r"&M_\[(\d)\]", joined)})
+        self.all_bits = (1 << len(CACHED)) - 1 | (X87_BIT if self.x87 else 0)
+        for k in self.xmm:
+            self.all_bits |= XMM_BIT[k]
+        for k in self.mm:
+            self.all_bits |= MM_BIT[k]
+
+    def load(self):
+        out = ["Regs R_ = { " + ", ".join(f"c->{n}" for n in CACHED) + " }; Regs *const r = &R_;"]
+        if self.x87:
+            out.append("X87 F_; X87 *const x = &F_; X87_LOAD(x, c);")
+        if self.xmm:
+            out.append("XMM V_[8]; " + " ".join(f"V_[{k}] = c->xmm[{k}];" for k in self.xmm))
+        if self.mm:
+            out.append("uint64_t M_[8]; " + " ".join(f"M_[{k}] = c->mm[{k}];" for k in self.mm))
+        return " ".join(out)
+
+    def reload(self):
+        out = [f"r->{n} = c->{n};" for n in CACHED]
+        if self.x87:
+            out.append("X87_LOAD(x, c);")
+        out += [f"V_[{k}] = c->xmm[{k}];" for k in self.xmm] + [f"M_[{k}] = c->mm[{k}];" for k in self.mm]
+        return " ".join(out)
+
+    @staticmethod
+    def spill(dirty):
+        out = [f"c->{n} = r->{n}; " for n in CACHED if dirty & CBIT[n]]
+        if dirty & X87_BIT:
+            out.append("X87_STORE(x, c); ")
+        out += [f"c->xmm[{k}] = V_[{k}]; " for k in range(8) if dirty & XMM_BIT[k]]
+        out += [f"c->mm[{k}] = M_[{k}]; " for k in range(8) if dirty & MM_BIT[k]]
+        return "".join(out)
+
+    def events(self, k):
+        """(start, end, kind, value) in text order: writes, calls that see the CPU, returns."""
+        stmt = self.texts[k]
+        if self.x87_sync[k]:   # the whole statement works on the CPU's x87 state
+            return [(0, len(stmt), "x87sync", stmt)]
+        ev = []
+        for m in _SYNC_CALL.finditer(stmt):
+            kind = "trap" if m.group(1) == "guest_trap" else "tail" if m.group(2) else "call"
+            ev.append((m.start(), m.end(), kind, m.group(0)))
+        inside = lambda pos: any(a <= pos < b for a, b, _, _ in ev)
+        ev += [(m.start(), m.end(), "ret", None) for m in _RETURN.finditer(stmt) if not inside(m.start())]
+        for rx, bits in _WRITES:
+            ev += [(m.start(), m.start(), "write", bits(m) if callable(bits) else bits) for m in rx.finditer(stmt)]
+        return sorted(ev, key=lambda e: e[0])
+
+    @staticmethod
+    def transfer(events, dirty):
+        for _, _, kind, v in events:
+            if kind == "write":
+                dirty |= v
+            elif kind == "call":   # written back before it and reloaded after: nothing changed since
+                dirty = 0
+            elif kind == "x87sync":
+                dirty &= ~X87_BIT
+        return dirty
+
+    def emit(self, k, dirty):
+        stmt, out, pos = self.texts[k], [], 0
+        for a, b, kind, v in self.events(k):
+            if kind == "write":
+                dirty |= v
+                continue
+            out.append(stmt[pos:a])
+            pos = b
+            if kind == "ret":
+                out.append(f"{{ {self.spill(dirty)}return; }}")
+            elif kind == "call":
+                out.append(f"{{ {self.spill(dirty)}{v} {self.reload()} }}")
+                dirty = 0
+            elif kind == "x87sync":
+                out.append(f"{{ X87_STORE(x, c); {v} X87_LOAD(x, c); }}")
+            else:   # a tail call or a trap ends this path; the text after it belongs to the other path
+                out.append(f"{{ {self.spill(dirty)}{v.strip()} }}")
+        out.append(stmt[pos:])
+        return "".join(out)
+
+    def run(self):
+        body, n = self.body, len(self.body)
+        at = {ins.address: k for k, (ins, _) in enumerate(body) if ins is not None}
+        events = [self.events(k) for k in range(n)]
+        succ = []
+        for k, (ins, _) in enumerate(body):
+            out = [at[int(t, 16)] for t in _GOTO.findall(self.texts[k])]
+            if ins is not None and not FunctionTranslator.is_terminator(ins) and k + 1 < n:
+                out.append(k + 1)
+            succ.append(out)
+        # forward dataflow: what may differ from the CPU struct on entry to each statement
+        din, dout = [0] * n, [-1] * n
+        work = list(range(n - 1, -1, -1))
+        while work:
+            k = work.pop()
+            d = self.transfer(events[k], din[k])
+            if d != dout[k]:
+                dout[k] = d
+                for s in succ[k]:
+                    if din[s] | d != din[s]:
+                        din[s] |= d
+                        work.append(s)
+        return [self.emit(k, din[k]) for k in range(n)]
 
 
 class FunctionTranslator:
@@ -214,16 +401,21 @@ class FunctionTranslator:
             following = insns[k + 1].address if k + 1 < len(insns) else None
             if following != nxt and not self.is_terminator(ins):
                 body.append((None, self.target_stmt(nxt)))
-        lines = [f"void f_{self.entry:08x}(CPU *c) {{ /* {self.f['name']} */"]
-        for ins, stmt in body:
+        if self.p.trace:
+            body = [(ins, f"trace_insn(c, 0x{ins.address:08x}u); {stmt}" if ins is not None else stmt)
+                    for ins, stmt in body]
+        cache = RegisterCache(body)
+        texts = cache.run()
+        lines = [f"void f_{self.entry:08x}(CPU *c) {{ /* {self.f['name']} */", "    PREEMPT_POLL(c);",
+                 f"    {cache.load()}"]
+        for (ins, _), stmt in zip(body, texts):
             if ins is not None:
                 if ins.address in self.labels:
                     lines.append(f"L_{ins.address:08x}:;")
-                if self.p.trace:
-                    lines.append(f"    trace_insn(c, 0x{ins.address:08x}u);")
                 lines.append(f"    {stmt} /* {ins.mnemonic} {ins.op_str} */")
             else:
                 lines.append(f"    {stmt}")
+        lines.append(f"    {cache.spill(cache.all_bits)}")   # every path ends in a return or tail call; just in case
         lines.append("}")
         return "\n".join(lines) + "\n", unsupported, len(insns)
 

@@ -13,25 +13,26 @@ uint8_t *g_mem;
 
 typedef struct { uint32_t addr; GuestFn fn; } FnEntry;
 static FnEntry *g_fns;
-static uint32_t g_fn_cap;  /* power of two */
+#define FN_BITS 17                 /* ~32K functions: a quarter full, so lookups rarely probe */
+#define FN_CAP (1u << FN_BITS)
+/* Fibonacci hashing takes the product's top bits: most function addresses are 16-byte aligned, so the
+   low bits of addr * k are mostly zero and would pile entries into a sixteenth of the table. */
+static inline uint32_t fn_slot(uint32_t addr) { return (addr * 2654435761u) >> (32 - FN_BITS); }
 
 void register_function(uint32_t addr, GuestFn fn) {
-    if (!g_fns) {
-        g_fn_cap = 1u << 16;
-        g_fns = calloc(g_fn_cap, sizeof *g_fns);
-    }
-    uint32_t i = (addr * 2654435761u) & (g_fn_cap - 1);
-    while (g_fns[i].fn && g_fns[i].addr != addr) i = (i + 1) & (g_fn_cap - 1);
+    if (!g_fns) g_fns = calloc(FN_CAP, sizeof *g_fns);
+    uint32_t i = fn_slot(addr);
+    while (g_fns[i].fn && g_fns[i].addr != addr) i = (i + 1) & (FN_CAP - 1);
     g_fns[i].addr = addr;
     g_fns[i].fn = fn;
 }
 
 GuestFn lookup_function(uint32_t addr) {
     if (!g_fns) return NULL;
-    uint32_t i = (addr * 2654435761u) & (g_fn_cap - 1);
+    uint32_t i = fn_slot(addr);
     while (g_fns[i].fn) {
         if (g_fns[i].addr == addr) return g_fns[i].fn;
-        i = (i + 1) & (g_fn_cap - 1);
+        i = (i + 1) & (FN_CAP - 1);
     }
     return NULL;
 }
@@ -230,7 +231,12 @@ void cpuid(CPU *c) {
 
 #include <time.h>
 /* A 2 GHz timestamp counter, consistent with the CPU speed reported through the registry. */
+uint64_t (*g_rdtsc_hook)(void);   /* set by the host for deterministic runs */
+int g_preempt_on;
+void (*g_preempt_fn)(void);       /* the deterministic scheduler's yield */
+void guest_preempt(CPU *c) { c->preempt_ticks = 0; if (g_preempt_fn) g_preempt_fn(); }
 void rdtsc(CPU *c) {
+    if (g_rdtsc_hook) { uint64_t t = g_rdtsc_hook(); c->eax = (uint32_t)t; c->edx = (uint32_t)(t >> 32); return; }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t t = (uint64_t)ts.tv_sec * 2000000000ull + (uint64_t)ts.tv_nsec * 2ull;
@@ -283,6 +289,7 @@ static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
 static uint32_t rd32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
 uint32_t g_image_lo, g_image_hi;
+uint32_t g_state_lo, g_state_hi;
 
 int load_image(const char *path, LoadedImage *out) {
     FILE *f = fopen(path, "rb");
@@ -310,6 +317,10 @@ int load_image(const char *path, LoadedImage *out) {
         uint32_t n = rawsz < vsize ? rawsz : vsize;
         memset(HP(image_base + va), 0, vsize);
         memcpy(HP(image_base + va), file + rawptr, n);
+        if (rd32(sec + 36) & 0x80000000u) {   /* IMAGE_SCN_MEM_WRITE */
+            if (!g_state_lo || image_base + va < g_state_lo) g_state_lo = image_base + va;
+            if (image_base + va + vsize > g_state_hi) g_state_hi = image_base + va + vsize;
+        }
     }
 
     /* Resolve imports: each IAT slot gets a magic address that dispatches to a host handler. */

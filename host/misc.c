@@ -93,7 +93,7 @@ const ImportTable advapi32_imports = { adv_list, sizeof adv_list / sizeof adv_li
 
 /* ================================================================== WINMM */
 
-W(timeGetTime) { RET(0, (uint32_t)(host_seconds() * 1000.0)); }
+W(timeGetTime) { RET(0, (uint32_t)(guest_seconds() * 1000.0)); }
 W(timeBeginPeriod) { RET(1, 0); }
 W(timeEndPeriod) { RET(1, 0); }
 W(timeGetDevCaps) { W32(ARG(0), 1); W32(ARG(0) + 4, 1000000); RET(2, 0); }
@@ -107,20 +107,57 @@ static pthread_mutex_t g_timer_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_timer_cv = PTHREAD_COND_INITIALIZER;
 static uint32_t g_next_timer_id = 1;
 static int g_timer_thread_started;
+static void *g_timer_sched;   /* deterministic mode: the timer thread's scheduler record */
+
+/* Deterministic mode: when the earliest timer is due, in virtual microseconds (the scheduler wakes the
+   timer thread then). Evaluated while every other thread is parked. */
+static uint64_t timers_next_due_us(void) {
+    uint64_t best = UINT64_MAX;
+    for (int i = 0; i < 64; i++)
+        if (g_timers[i].id) {
+            double us = (g_timers[i].due - 60.0) * 1e6;
+            uint64_t u = us <= 0 ? 0 : (uint64_t)us + 1;
+            if (u < best) best = u;
+        }
+    return best;
+}
 
 static void *timer_main(void *arg) {
     (void)arg;
+    sched_enter(g_timer_sched);
     GuestThread *t = guest_thread_new();
     t_self = t;
     CPU *c = &t->cpu;
     fpu_sync_rounding(c);
+    if (g_timer_sched) {
+        /* deterministic: sleep in the scheduler until the next timer is due, then fire every due one */
+        for (;;) {
+            sched_wait(NULL, NULL, 0, timers_next_due_us);
+            for (;;) {
+                double now = guest_peek_seconds();
+                int best = -1;
+                for (int i = 0; i < 64; i++)
+                    if (g_timers[i].id && g_timers[i].due <= now && (best < 0 || g_timers[i].due < g_timers[best].due)) best = i;
+                if (best < 0) break;
+                Timer tm = g_timers[best];
+                if (tm.periodic) {
+                    g_timers[best].due += tm.delay / 1000.0;
+                    if (g_timers[best].due < now - 0.25) g_timers[best].due = now;
+                } else {
+                    g_timers[best].id = 0;
+                }
+                uint32_t a[5] = { tm.id, 0, tm.user, 0, 0 };
+                guest_stdcall(c, tm.callback, 5, a);
+            }
+        }
+    }
     pthread_mutex_lock(&g_timer_lock);
     for (;;) {
         int best = -1;
         for (int i = 0; i < 64; i++)
             if (g_timers[i].id && (best < 0 || g_timers[i].due < g_timers[best].due)) best = i;
         if (best < 0) { pthread_cond_wait(&g_timer_cv, &g_timer_lock); continue; }
-        double now = host_seconds();
+        double now = guest_seconds();
         if (g_timers[best].due > now) {
             /* sleep in short steps and re-check (a timed condition wait never woke up in WebAssembly);
                new timers are picked up within a millisecond */
@@ -158,11 +195,12 @@ W(timeSetEvent) {
     if (slot < 0) { pthread_mutex_unlock(&g_timer_lock); RET(5, 0); }
     uint32_t id = g_next_timer_id++;
     if (!g_next_timer_id) g_next_timer_id = 1;
-    g_timers[slot] = (Timer){ id, delay ? delay : 1, cb, user, flags & 1, host_seconds() + (delay ? delay : 1) / 1000.0 };
+    g_timers[slot] = (Timer){ id, delay ? delay : 1, cb, user, flags & 1, guest_seconds() + (delay ? delay : 1) / 1000.0 };
     static int nset;
     if (nset++ < 5) LOG("[winmm] timeSetEvent(%u ms) at %.3f on thread %x\n", delay, host_seconds(), t_self ? t_self->id : 0);
     if (!g_timer_thread_started) {
         g_timer_thread_started = 1;
+        g_timer_sched = sched_new("timer", NULL, NULL);
         pthread_t pt;
         pthread_attr_t at;
         pthread_attr_init(&at);

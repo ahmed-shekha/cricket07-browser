@@ -103,6 +103,7 @@ uint32_t guest_valloc(uint32_t size) {
     return a;  /* never handed out before, so still zero */
 }
 
+void guest_mem_ranges(uint32_t r[4]) { r[0] = HEAP_LO; r[1] = g_heap_top; r[2] = VALLOC_LO; r[3] = g_valloc_top; }
 void guest_mem_stats(uint32_t *heap_used, uint32_t *valloc_used) {
     *heap_used = g_heap_top - HEAP_LO;
     *valloc_used = g_valloc_top - VALLOC_LO;
@@ -250,10 +251,80 @@ double host_seconds(void) {
     return now - start + 60.0;
 }
 
+/* ------------------------------------------------------------------ the game's clock */
+
+/* With RC_DETERMINISTIC=1 the game sees a virtual clock driven by the deterministic scheduler (sched.c):
+   it jumps to the next deadline when every thread is blocked, and every read adds 1 us so a spin-wait on
+   the clock still makes progress. Present blocks until the next 1/60 s tick (vsync). */
+static int g_det = -1;
+uint64_t g_vtime_us;             /* virtual microseconds (sched.c advances it) */
+uint32_t g_det_sleeps, g_det_waits, g_det_reads;   /* game-thread counters for the hash log */
+static GuestThread g_main_thread;
+
+int deterministic(void) {
+    if (g_det < 0) g_det = getenv("RC_DETERMINISTIC") != NULL;
+    return g_det;
+}
+int on_game_thread(void) { return t_self == &g_main_thread; }
+
+double guest_seconds(void) {
+    if (!deterministic()) return host_seconds();
+    if (on_game_thread()) g_det_reads++;
+    return 60.0 + (double)__atomic_add_fetch(&g_vtime_us, 1, __ATOMIC_RELAXED) * 1e-6;
+}
+double guest_peek_seconds(void) {   /* the game's clock without advancing it */
+    if (!deterministic()) return host_seconds();
+    return 60.0 + (double)__atomic_load_n(&g_vtime_us, __ATOMIC_RELAXED) * 1e-6;
+}
+uint64_t guest_time_100ns(void) {
+    if (!deterministic()) return host_time_100ns();
+    /* 2006-01-01 00:00 UTC in FILETIME units, plus the virtual clock */
+    return 127804032000000000ull + (uint64_t)((guest_seconds() - 60.0) * 1e7);
+}
+/* Present: wait for the next vsync tick (exact multiples of 1/60 s); online, the frame lasts the time the
+   host measured for it (netplay.c), counted from the previous frame's boundary. */
+void vclock_frame(void) {
+    if (!deterministic() || !on_game_thread()) return;
+    extern int sched_wait(int (*)(void *), void *, uint64_t, uint64_t (*)(void));
+    extern uint32_t netplay_frame_dt_us(void);
+    uint64_t now = __atomic_load_n(&g_vtime_us, __ATOMIC_RELAXED);
+    uint32_t dt = netplay_frame_dt_us();
+    if (dt) {
+        static uint64_t boundary;
+        boundary += dt;
+        if (boundary < now) boundary = now;   /* the frame already took longer in game time (loading) */
+        sched_wait(NULL, NULL, boundary, NULL);
+        return;
+    }
+    uint64_t k = now * 60ull / 1000000ull + 1;
+    sched_wait(NULL, NULL, (k * 1000000ull + 59ull) / 60ull, NULL);
+}
+static uint64_t vclock_rdtsc(void) { return (uint64_t)(guest_seconds() * 2e9); }   /* 2 GHz, as the registry says */
+/* A thread preempted after a full quantum has used CPU time, so the clock moves on by RC_DET_PREEMPT_US
+   (default 1000) before the next participant is picked. Without it a thread that spins on memory without
+   reading the clock (Cricket's loading screen polling its async loader) never lets a timer come due, and
+   the timer callback it waits for never runs. */
+static void vclock_preempt(void) {
+    static int64_t us = -1;
+    if (us < 0) { const char *e = getenv("RC_DET_PREEMPT_US"); us = e ? atoll(e) : 1000; }
+    __atomic_add_fetch(&g_vtime_us, (uint64_t)us, __ATOMIC_RELAXED);
+    sched_yield_det();
+}
+void vclock_init(void) {
+    extern uint64_t (*g_rdtsc_hook)(void);
+    extern int g_preempt_on;
+    extern void (*g_preempt_fn)(void);
+    if (deterministic()) {
+        g_rdtsc_hook = vclock_rdtsc;
+        g_preempt_fn = vclock_preempt;
+        g_preempt_on = 1;
+        fprintf(stderr, "deterministic mode: virtual clock + scheduler\n");
+    }
+}
+
 /* ------------------------------------------------------------------ threads */
 
 __thread GuestThread *t_self;
-static GuestThread g_main_thread;
 
 GuestThread *thread_main_init(CPU *c) {
     (void)c;

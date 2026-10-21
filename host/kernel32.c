@@ -336,10 +336,10 @@ W(GetLocaleInfoW) {
 
 /* ------------------------------------------------------------------ time */
 
-W(GetTickCount) { RET(0, (uint32_t)(host_seconds() * 1000.0)); }
+W(GetTickCount) { RET(0, (uint32_t)(guest_seconds() * 1000.0)); }
 W(QueryPerformanceFrequency) { W64(ARG(0), 1000000000ull); RET(1, 1); }
-W(QueryPerformanceCounter) { W64(ARG(0), (uint64_t)(host_seconds() * 1e9)); RET(1, 1); }
-W(GetSystemTimeAsFileTime) { W64(ARG(0), host_time_100ns()); RET(1, 0); }
+W(QueryPerformanceCounter) { W64(ARG(0), (uint64_t)(guest_seconds() * 1e9)); RET(1, 1); }
+W(GetSystemTimeAsFileTime) { W64(ARG(0), guest_time_100ns()); RET(1, 0); }
 W(FileTimeToLocalFileTime) { W64(ARG(1), R64(ARG(0))); RET(2, 1); }
 W(FileTimeToSystemTime) {
     uint64_t ft = R64(ARG(0));
@@ -415,11 +415,11 @@ W(TlsSetValue) { if (ARG(0) < 64) t_self->tls[ARG(0)] = ARG(1); RET(2, 1); }
 
 /* ------------------------------------------------------------------ critical sections and interlocked */
 
-typedef struct CS { uint32_t key; pthread_mutex_t m; struct CS *next; } CS;
+typedef struct CS { uint32_t key; pthread_mutex_t m; struct CS *next; GuestThread *owner; int depth; } CS;
 static CS *g_cs[1024];
 static pthread_mutex_t g_cs_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static pthread_mutex_t *cs_for(uint32_t key) {
+static CS *cs_get(uint32_t key) {
     uint32_t h = (key >> 2) & 1023;
     pthread_mutex_lock(&g_cs_lock);
     CS *x = g_cs[h];
@@ -435,12 +435,28 @@ static pthread_mutex_t *cs_for(uint32_t key) {
         g_cs[h] = x;
     }
     pthread_mutex_unlock(&g_cs_lock);
-    return &x->m;
+    return x;
 }
+static pthread_mutex_t *cs_for(uint32_t key) { return &cs_get(key)->m; }
+/* Deterministic mode: ownership is tracked here and a contended Enter blocks in the scheduler (a host
+   mutex would block while holding the scheduler's baton). */
+static int cs_free(void *p) { return ((CS *)p)->owner == NULL; }
 W(InitializeCriticalSection) { memset(HP(ARG(0)), 0, 24); W32(ARG(0) + 4, 0xFFFFFFFFu); cs_for(ARG(0)); RET(1, 0); }
 W(DeleteCriticalSection) { RET(1, 0); }
-W(EnterCriticalSection) { pthread_mutex_lock(cs_for(ARG(0))); RET(1, 0); }
-W(LeaveCriticalSection) { pthread_mutex_unlock(cs_for(ARG(0))); RET(1, 0); }
+W(EnterCriticalSection) {
+    if (!sched_active()) { pthread_mutex_lock(cs_for(ARG(0))); RET(1, 0); }
+    CS *x = cs_get(ARG(0));
+    if (x->owner != t_self) sched_wait(cs_free, x, UINT64_MAX, NULL);
+    x->owner = t_self;
+    x->depth++;
+    RET(1, 0);
+}
+W(LeaveCriticalSection) {
+    if (!sched_active()) { pthread_mutex_unlock(cs_for(ARG(0))); RET(1, 0); }
+    CS *x = cs_get(ARG(0));
+    if (x->owner == t_self && --x->depth == 0) x->owner = NULL;
+    RET(1, 0);
+}
 
 /* same global lock as the translated lock-prefixed instructions, so both agree */
 W(InterlockedIncrement) { guest_lock(); uint32_t v = R32(ARG(0)) + 1; W32(ARG(0), v); guest_unlock(); RET(1, v); }
@@ -558,9 +574,34 @@ static int try_acquire(WinHandle *x, int waited) {
     }
 }
 
+/* Deterministic mode: could try_acquire succeed now? (Evaluated by the scheduler for a parked waiter.) */
+static int can_acquire(void *p) {
+    WinHandle *x = p;
+    Sync *s = x->ptr;
+    switch (x->type) {
+    case H_EVENT: return s->signaled;
+    case H_SEMAPHORE: return s->count > 0;
+    case H_MUTEX: return !s->owned;
+    case H_THREAD: return s->finished;
+    default: return 1;
+    }
+}
+static uint32_t wait_one_det(WinHandle *x, uint32_t ms) {
+    Sync *s = x->ptr;
+    uint64_t deadline = ms == 0xFFFFFFFFu ? UINT64_MAX : sched_now_us() + (uint64_t)ms * 1000ull;
+    for (;;) {
+        pthread_mutex_lock(&s->m);
+        int ok = try_acquire(x, 1);
+        pthread_mutex_unlock(&s->m);
+        if (ok) return 0;
+        if (ms == 0 || !sched_wait(can_acquire, x, deadline, NULL)) return 0x102;   /* WAIT_TIMEOUT */
+    }
+}
+
 static uint32_t wait_one(uint32_t h, uint32_t ms) {
     WinHandle *x = handle_get(h, -1);
     if (!x || !x->ptr) return 0;  /* unknown objects count as signaled */
+    if (sched_active()) return wait_one_det(x, ms);
     Sync *s = x->ptr;
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
@@ -586,15 +627,36 @@ static uint32_t wait_one(uint32_t h, uint32_t ms) {
     pthread_mutex_unlock(&s->m);
     return r;
 }
-W(WaitForSingleObject) { RET(2, wait_one(ARG(0), ARG(1))); }
+W(WaitForSingleObject) {
+    extern uint32_t g_det_waits;
+    if (on_game_thread()) g_det_waits++;
+    RET(2, wait_one(ARG(0), ARG(1)));
+}
 
+/* Deterministic mode: a timed block. A zero-length sleep (a yield) also lets RC_DET_YIELD_US (default
+   1000) of virtual time pass: Cricket 07's intro-movie player spins on
+   SleepEx(0) until the next movie frame is due, and with only the 1 us per clock read that took ~6,600
+   scheduler hand-offs per frame (about 2 fps). */
+static int det_sleep(uint32_t ms) {
+    if (!sched_active()) return 0;
+    extern uint32_t g_det_sleeps;
+    if (on_game_thread()) g_det_sleeps++;
+    static int64_t yield_us = -1;
+    if (yield_us < 0) { const char *e = getenv("RC_DET_YIELD_US"); yield_us = e ? atoll(e) : 1000; }
+    uint64_t us = ms ? (uint64_t)ms * 1000ull : (uint64_t)yield_us;
+    if (!us) sched_yield_det();
+    else sched_wait(NULL, NULL, sched_now_us() + us, NULL);
+    return 1;
+}
 W(Sleep) {
     uint32_t ms = ARG(0);
+    if (det_sleep(ms)) RET(1, 0);
     if (ms == 0) sched_yield(); else usleep(ms * 1000);
     RET(1, 0);
 }
 W(SleepEx) {
     uint32_t ms = ARG(0);
+    if (det_sleep(ms)) RET(2, 0);
     if (ms == 0) sched_yield(); else usleep(ms * 1000);
     RET(2, 0);
 }
@@ -605,13 +667,15 @@ W(SleepEx) {
 static uint32_t g_next_tid = 0x200;
 
 typedef struct { GuestThread *t; uint32_t start, param; Sync *sync; int suspended; pthread_mutex_t go_m;
-                 pthread_cond_t go_cv; } ThreadStart;
+                 pthread_cond_t go_cv; void *sched; } ThreadStart;
+static int thread_resumed(void *p) { return !((ThreadStart *)p)->suspended; }
 
 static void *thread_main(void *arg) {
     ThreadStart *ts = arg;
     t_self = ts->t;
     CPU *c = &ts->t->cpu;
     fpu_sync_rounding(c);
+    sched_enter(ts->sched);   /* deterministic mode: runs once resumed and scheduled */
     pthread_mutex_lock(&ts->go_m);
     while (ts->suspended) pthread_cond_wait(&ts->go_cv, &ts->go_m);
     pthread_mutex_unlock(&ts->go_m);
@@ -625,6 +689,7 @@ static void *thread_main(void *arg) {
     pthread_cond_broadcast(&ts->sync->cv);
     pthread_mutex_unlock(&ts->sync->m);
     LOG("[kernel32] thread %x exits with %u\n", ts->t->id, c->eax);
+    sched_exit();
     return NULL;
 }
 
@@ -667,6 +732,9 @@ W(CreateThread) {
     handle_get(h, H_THREAD)->ptr = ts->sync;
     g_threads_by_handle[(h - 0x1000) / 4] = ts;
     if (tid_out) W32(tid_out, t->id);
+    char name[24];
+    snprintf(name, sizeof name, "thread %x", t->id);
+    ts->sched = sched_new(name, ts->suspended ? thread_resumed : NULL, ts);
     pthread_t pt;
     pthread_attr_t at;
     pthread_attr_init(&at);
@@ -691,6 +759,7 @@ W(ResumeThread) {
 }
 W(ExitThread) {
     LOG("[kernel32] ExitThread(%u)\n", ARG(0));
+    sched_exit();
     pthread_exit(NULL);
 }
 W(TerminateThread) { STUB("TerminateThread(%x) ignored\n", ARG(0)); RET(2, 1); }

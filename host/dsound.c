@@ -146,9 +146,22 @@ static void ring_write(const float *f, int frames) {
 
 /* Without an audio device, a thread still advances cursors in real time so streaming keeps working
    (in the browser it also feeds the AudioWorklet's ring). Paced by the clock, not by sleeps alone. */
+static void *g_mixer_sched;   /* deterministic mode: mixes in virtual time, as a scheduled participant */
 static void *silent_mixer(void *arg) {
     (void)arg;
     float tmp[2 * 441];
+    if (g_mixer_sched) {
+        sched_enter(g_mixer_sched);
+        for (uint64_t next = sched_now_us();; ) {
+            mix_frames(tmp, 441);             /* 10 ms of game time */
+#ifdef __EMSCRIPTEN__
+            /* the page plays it; the ring drops what doesn't fit and never touches game state */
+            if (!getenv("RC_NO_AUDIO")) ring_write(tmp, 441);
+#endif
+            next += 10000;
+            sched_wait(NULL, NULL, next, NULL);
+        }
+    }
     double next = host_seconds();
     for (unsigned n = 0;; n++) {
         mix_frames(tmp, 441);                 /* 10 ms */
@@ -167,8 +180,9 @@ static void *silent_mixer(void *arg) {
 static void start_mixer(void) {
     if (g_mixer_started) return;
     g_mixer_started = 1;
+    g_mixer_sched = sched_new("mixer", NULL, NULL);
 #ifdef __APPLE__
-    if (!getenv("RC_NO_AUDIO") && start_coreaudio()) { LOG("[dsound] CoreAudio output started\n"); return; }
+    if (!g_mixer_sched && !getenv("RC_NO_AUDIO") && start_coreaudio()) { LOG("[dsound] CoreAudio output started\n"); return; }
 #endif
     pthread_t t;
     pthread_create(&t, NULL, silent_mixer, NULL);

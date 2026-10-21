@@ -218,13 +218,36 @@ static uint32_t sampler_key(const uint32_t *tss) {
 }
 
 /* send a texture's contents if they changed since the last upload */
+/* DXT textures go to the GPU as BC blocks when it can sample them: 4-8x less GPU memory than RGBA8 (a match
+   needs hundreds of MB uncompressed, more than some GPUs/browsers give a page). WebGPU wants whole blocks,
+   so the base level must be a multiple of 4; other textures are converted. */
+static uint32_t bc_format(const Texture *t) {
+    if (!g_gpu_bc || !format_is_dxt(t->format) || t->lw[0] % 4 || t->lh[0] % 4) return TEXFMT_RGBA8;
+    return t->format == FMT_DXT1 ? TEXFMT_BC1 : t->format <= FMT_DXT3 ? TEXFMT_BC2 : TEXFMT_BC3;
+}
+
 static void sync_texture(Device *d, Texture *t) {
     if (t->sent_version == t->version) return;
+    uint32_t fmt = bc_format(t), bs = fmt == TEXFMT_BC1 ? 8 : 16;
     size_t total = 0;
-    for (uint32_t l = 0; l < t->levels && l < 14; l++) total += (size_t)t->lw[l] * t->lh[l] * 4;
+    for (uint32_t l = 0; l < t->levels && l < 14; l++)
+        total += fmt ? (size_t)((t->lw[l] + 3) / 4) * ((t->lh[l] + 3) / 4) * bs : (size_t)t->lw[l] * t->lh[l] * 4;
     CmdUploadTex *c = cmd_alloc(CMD_UPLOAD_TEX, sizeof *c + total);
     c->id = t->gpu_id;
     c->levels = t->levels < 14 ? t->levels : 14;
+    c->fmt = fmt;
+    if (fmt) {
+        uint8_t *out = (uint8_t *)(c + 1);
+        for (uint32_t l = 0; l < c->levels; l++) {
+            uint32_t bw = (t->lw[l] + 3) / 4, bh = (t->lh[l] + 3) / 4;
+            c->w[l] = t->lw[l]; c->h_[l] = t->lh[l];
+            for (uint32_t by = 0; by < bh; by++) memcpy(out + (size_t)by * bw * bs, HP(t->mem[0][l] + by * t->pitch[l]), (size_t)bw * bs);
+            out += (size_t)bw * bh * bs;
+        }
+        cmd_end();
+        t->sent_version = t->version;
+        return;
+    }
     uint8_t *out = (uint8_t *)(c + 1);
     const uint8_t *pal = d->st.palette_current < 1024 ? g_palettes[d->st.palette_current] : NULL;
     for (uint32_t l = 0; l < c->levels; l++) {
@@ -481,7 +504,16 @@ static void rec_present_impl(Device *d) {
     g_target_sent = 0;   /* the executor ends every frame on the back buffer */
     g_f_drawn = 0;
 #ifdef __EMSCRIPTEN__
-    while (web_queued_frames() >= 2) usleep(1000);   /* don't run ahead of the display */
+    /* Don't run ahead of the display: two frames queued (a slow frame doesn't skip a vsync). Online every
+       queued frame is a frame of input latency on top of the lockstep delay, so RC_QUEUE=1 (?queue=1 on
+       the page) allows one there, for a machine that simulates a frame well within 16 ms. */
+    static int depth = -1;
+    if (depth < 0) {
+        const char *q = getenv("RC_QUEUE");
+        depth = q ? atoi(q) : 2;
+        if (depth < 1) depth = 1;
+    }
+    while (web_queued_frames() >= depth) usleep(1000);
 #endif
 }
 

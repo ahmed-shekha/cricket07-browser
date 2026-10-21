@@ -293,6 +293,61 @@ W(dev_Reset) {
     if (R32(pp)) { d->width = R32(pp); d->height = R32(pp + 4); }
     RET(2, S_OK);
 }
+/* Determinism checks: RC_HASH_LOG=<file> writes a hash of the game's global data (the executable's
+   writable sections, g_state_lo-g_state_hi) every frame; RC_SNAPSHOT=<frame>,... writes that memory raw to
+   <RC_SNAPSHOT_DIR or /tmp>/rc_state_<frame>.bin, to diff two runs at their first differing frame. */
+static uint64_t state_hash_globals(void) {
+    uint64_t h = 1469598103934665603ull;   /* FNV-1a over 8-byte words */
+    for (uint32_t a = g_state_lo; a + 8 <= g_state_hi; a += 8) { h ^= R64(a); h *= 1099511628211ull; }
+    return h;
+}
+static void state_hash_tick(uint32_t frame) {
+    static FILE *log = (FILE *)1;
+    static const char *snap = (const char *)1;
+    if (log == (FILE *)1) { const char *p = getenv("RC_HASH_LOG"); log = p ? fopen(p, "w") : NULL; }
+    if (snap == (const char *)1) snap = getenv("RC_SNAPSHOT");
+    if (log) {
+        uint64_t h = state_hash_globals();
+        extern uint32_t g_det_sleeps, g_det_waits, g_det_reads;
+        fprintf(log, "%u %016llx sleeps=%u waits=%u reads=%u t=%.6f\n", frame, (unsigned long long)h, g_det_sleeps,
+                g_det_waits, g_det_reads, guest_peek_seconds());
+        /* RC_HASH_ALL=N: every N frames also the heap and VirtualAlloc'd memory (thread stacks, game pools) */
+        static int every = -1;
+        if (every < 0) every = getenv("RC_HASH_ALL") ? atoi(getenv("RC_HASH_ALL")) : 0;
+        if (every > 0 && frame % (uint32_t)every == 0) {
+            extern void guest_mem_ranges(uint32_t r[4]);
+            uint32_t r[4];
+            guest_mem_ranges(r);
+            uint64_t hh = 1469598103934665603ull, hv = hh;
+            for (uint32_t a = r[0]; a + 8 <= r[1]; a += 8) { hh ^= R64(a); hh *= 1099511628211ull; }
+            for (uint32_t a = r[2]; a + 8 <= r[3]; a += 8) { hv ^= R64(a); hv *= 1099511628211ull; }
+            fprintf(log, "%u heap %016llx %u MB valloc %016llx %u MB\n", frame, (unsigned long long)hh, (r[1] - r[0]) >> 20,
+                    (unsigned long long)hv, (r[3] - r[2]) >> 20);
+        }
+        fflush(log);
+    }
+    if (snap) {
+        char tmp[16];
+        snprintf(tmp, sizeof tmp, "%u", frame);
+        for (const char *p = strstr(snap, tmp); p; p = strstr(p + 1, tmp)) {
+            size_t n = strlen(tmp);
+            if ((p != snap && p[-1] != ',') || (p[n] && p[n] != ',')) continue;
+            char path[512];
+            snprintf(path, sizeof path, "%s/rc_state_%u.bin", getenv("RC_SNAPSHOT_DIR") ? getenv("RC_SNAPSHOT_DIR") : "/tmp", frame);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(HP(g_state_lo), 1, g_state_hi - g_state_lo, f); fclose(f); }
+            if (getenv("RC_SNAPSHOT_HEAP")) {   /* also the heap, as rc_heap_<frame>.bin */
+                extern void guest_mem_ranges(uint32_t r[4]);
+                uint32_t r[4];
+                guest_mem_ranges(r);
+                snprintf(path, sizeof path, "%s/rc_heap_%u.bin", getenv("RC_SNAPSHOT_DIR") ? getenv("RC_SNAPSHOT_DIR") : "/tmp", frame);
+                if ((f = fopen(path, "wb"))) { fwrite(HP(r[0]), 1, r[1] - r[0], f); fclose(f); }
+            }
+            break;
+        }
+    }
+}
+
 W(dev_Present) {
     Device *d = dev(c);
     d->frame++;
@@ -300,6 +355,16 @@ W(dev_Present) {
     extern void dump_tick(uint32_t frame);
     input_script_tick(d->frame);
     dump_tick(d->frame);
+    extern void netplay_frame(uint32_t frame, uint64_t (*state_hash)(void));
+    netplay_frame(d->frame, state_hash_globals);   /* lockstep: exchange and apply pad inputs */
+    vclock_frame();
+    state_hash_tick(d->frame);
+    static int exit_frame = -1;   /* RC_EXIT_FRAME=N: quit after frame N (benchmarks, determinism checks) */
+    if (exit_frame < 0) exit_frame = getenv("RC_EXIT_FRAME") ? atoi(getenv("RC_EXIT_FRAME")) : 0;
+    if (exit_frame && d->frame >= (uint32_t)exit_frame) {
+        fprintf(stderr, "[exit] frame %u after %.2f s\n", d->frame, host_seconds() - 60.0);
+        exit(0);
+    }
     static double last_t;
     static uint32_t last_f;
     static int fps_log = -1;
@@ -311,7 +376,10 @@ W(dev_Present) {
         extern void guest_mem_stats(uint32_t *, uint32_t *);
         uint32_t hu, vu;
         guest_mem_stats(&hu, &vu);
-        fprintf(stderr, "[mem] guest heap %u MB, virtual allocations %u MB\n", hu >> 20, vu >> 20);
+        extern size_t g_gpu_tex_bytes;
+        extern uint32_t g_gpu_bind_groups_made;
+        fprintf(stderr, "[mem] guest heap %u MB, virtual allocations %u MB, GPU textures %zu MB, bind groups made %u\n",
+                hu >> 20, vu >> 20, g_gpu_tex_bytes >> 20, g_gpu_bind_groups_made);
         last_t = now; last_f = d->frame;
     }
     if (g_render->present) g_render->present(d);
@@ -894,10 +962,14 @@ static ComInterface IDirect3DSwapChain8_i __attribute__((unused)) = { "IDirect3D
 
 /* ------------------------------------------------------------------ headless backend */
 
-/* Headless "vsync": pace Present to 60 Hz like a real display would. */
+/* Headless "vsync": pace Present to 60 Hz like a real display would. RC_NO_PACE=1 skips the wait, so a
+   deterministic run (virtual clock) goes as fast as the host allows: a benchmark of the CPU-side work. */
 static void hl_present(Device *d) {
     (void)d;
     static double next;
+    static int nopace = -1;
+    if (nopace < 0) nopace = getenv("RC_NO_PACE") != NULL;
+    if (nopace) return;
     double now = host_seconds();
     if (next == 0 || now - next > 0.1) next = now;
     next += 1.0 / 60.0;

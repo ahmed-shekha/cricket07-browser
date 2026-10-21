@@ -57,7 +57,7 @@ void (*g_pump_host_events)(void);  /* set by the window backend */
 
 static void write_msg(uint32_t p, const Msg *m) {
     W32(p, m->hwnd); W32(p + 4, m->msg); W32(p + 8, m->wp); W32(p + 12, m->lp);
-    W32(p + 16, (uint32_t)(host_seconds() * 1000)); W32(p + 20, 0); W32(p + 24, 0);
+    W32(p + 16, (uint32_t)(guest_seconds() * 1000)); W32(p + 20, 0); W32(p + 24, 0);
 }
 
 W(PeekMessageA) {
@@ -71,6 +71,7 @@ W(GetMessageA) {
     Msg m;
     while (!pop_message(&m, 1)) {
         if (g_pump_host_events) g_pump_host_events();
+        if (sched_active()) { sched_wait(NULL, NULL, sched_now_us() + 2000, NULL); continue; }
         struct timespec ts = { 0, 2000000 };
         nanosleep(&ts, NULL);
     }

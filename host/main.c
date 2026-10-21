@@ -27,6 +27,12 @@ static void *watchdog(void *arg) {
     int secs = (int)(intptr_t)arg;
     for (;;) {
         sleep((unsigned)secs);
+        if (deterministic()) {   /* a stuck game thread that doesn't move these spins on memory */
+            extern uint32_t g_det_reads, g_det_sleeps, g_det_waits;
+            extern uint64_t g_vtime_us;
+            fprintf(stderr, "[watchdog] virtual time %.6f s, game thread: clock reads %u, sleeps %u, waits %u\n",
+                    g_vtime_us * 1e-6, g_det_reads, g_det_sleeps, g_det_waits);
+        }
         extern GuestThread *g_all_threads[64];
         extern int g_nthreads;
         for (int t = -1; t < g_nthreads && t < 64; t++) {
@@ -47,6 +53,7 @@ static void *game_main(void *arg) {
     (void)arg;
     CPU *c = &g_cpu;
     thread_main_init(c);
+    sched_main_init();
     t_self->cpu = *c;            /* keep the thread record consistent with the main CPU */
     fpu_sync_rounding(c);
     GuestFn entry = lookup_function(g_img.entry);
@@ -69,7 +76,9 @@ int main(int argc, char **argv) {
 #endif
     const char *game = argc > 1 ? argv[1] : "game";
     if (!realpath(game, g_game_root)) { perror(game); return 1; }
-    snprintf(g_user_root, sizeof g_user_root, "%s/../userdata", g_game_root);
+    /* RC_USERDATA: another folder for saves and settings (e.g. a fresh copy per test run) */
+    if (getenv("RC_USERDATA")) snprintf(g_user_root, sizeof g_user_root, "%s", getenv("RC_USERDATA"));
+    else snprintf(g_user_root, sizeof g_user_root, "%s/../userdata", g_game_root);
     mkdir(g_user_root, 0755);
     g_log = getenv("RC_LOG") != NULL;
     extern int g_log_d3d;
@@ -84,6 +93,7 @@ int main(int argc, char **argv) {
     set_import_handlers(all, n);
 
     runtime_init(&g_cpu);
+    vclock_init();
     char exe[1100];
     snprintf(exe, sizeof exe, "%s/%s", g_game_root, getenv("RC_EXE") ? getenv("RC_EXE") : PROFILE_EXE);
     if (load_image(exe, &g_img)) return 1;

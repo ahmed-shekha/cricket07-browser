@@ -8,7 +8,7 @@
 set -e
 R=$(cd "$(dirname "$0")" && pwd)
 PFLAG=; [ -n "$PROFILE" ] && PFLAG="-DRC_PROFILE=\"$(cd "$(dirname "$PROFILE")" && pwd)/$(basename "$PROFILE")\""
-OPT=${OPT:--O1}
+OPT=${OPT:--O2}   # smaller and faster code than -O1, for about twice the compile time
 CFLAGS="$OPT -pthread -frounding-math -w $EXTRA_CFLAGS"
 OUT=out_all
 B="$R/build_web"
@@ -21,7 +21,7 @@ ls $OUT/*.c | while read f; do
     b=$(basename "$f" .c)
     h=$( (cat "$f"; echo "$CFLAGS") | shasum | cut -c1-40)
     if [ ! -f "$B/obj/$b.o" ] || [ "$(cat "$B/obj/$b.hash" 2>/dev/null)" != "$h" ]; then echo "$f $b $h"; fi
-done | xargs -P 10 -L 1 sh -c 'emcc '"$CFLAGS"' -Iruntime -I'"$OUT"' "$0" -c -o "'"$B"'/obj/$1.o" && echo "$2" > "'"$B"'/obj/$1.hash" && echo "  compiled $1"'
+done | xargs -r -P 10 -L 1 sh -c 'emcc '"$CFLAGS"' -Iruntime -I'"$OUT"' "$0" -c -o "'"$B"'/obj/$1.o" && echo "$2" > "'"$B"'/obj/$1.hash" && echo "  compiled $1"'
 for o in "$B"/obj/*.o; do [ -f "$OUT/$(basename "$o" .o).c" ] || rm -f "$o" "${o%.o}.hash"; done
 
 # runtime + Windows layer (the macOS-only window, renderer and watchpoint are left out)
@@ -41,6 +41,11 @@ emcc -pthread ${LINKOPT:-$OPT} --profiling-funcs -o "$B/www/recomp.js" "$B"/runt
     --use-port=emdawnwebgpu -sWASMFS -sPROXY_TO_PTHREAD -sPTHREAD_POOL_SIZE=16 -sALLOW_MEMORY_GROWTH \
     -sMAXIMUM_MEMORY=4GB -sSTACK_SIZE=8MB -sDEFAULT_PTHREAD_STACK_SIZE=32MB -sENVIRONMENT=web,worker \
     -sMODULARIZE -sEXPORT_NAME=createRecomp -sEXPORTED_RUNTIME_METHODS=ENV,wasmMemory -sEXIT_RUNTIME=0 $EXTRA_LINK
+# Firefox rejects any typed array over 2 GB as setBindGroup's dynamic offsets, and the bindings pass a view of
+# the whole wasm memory (with start/length): hand it a copy of just the offsets instead.
+# (matches both the -O1 and the minified -O2 output)
+perl -0pi -e 's/\(growMemViews\(\),\s*HEAPU32\),\s*\(*dynamicOffsetsPtr\)?\s*>>>\s*2\)?,\s*dynamicOffsetCount\)/(growMemViews(),HEAPU32.slice(dynamicOffsetsPtr>>>2,(dynamicOffsetsPtr>>>2)+dynamicOffsetCount)))/g' "$B/www/recomp.js"
+grep -q 'HEAPU32.slice(dynamicOffsetsPtr' "$B/www/recomp.js" || echo "warning: setBindGroup offsets patch did not apply (emdawnwebgpu changed?)" >&2
 echo "built build_web/www/recomp.js"
 
 # Node build: headless, real file system, RC_* environment passed through

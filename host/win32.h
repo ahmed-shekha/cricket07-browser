@@ -93,5 +93,24 @@ extern uint8_t g_keys[256];
 
 uint64_t host_time_100ns(void);  /* FILETIME units since 1601 */
 double host_seconds(void);       /* monotonic */
+/* Time the game sees (core.c). Normally host_seconds(); with RC_DETERMINISTIC=1 a virtual clock that only
+   the game's main thread advances (per Present, per Sleep, 1 us per time read), so it is a function of
+   that thread's execution rather than of wall time. */
+double guest_seconds(void);
+uint64_t guest_time_100ns(void); /* FILETIME units since 1601 */
+int deterministic(void);
+void vclock_frame(void);         /* Present */
+void vclock_init(void);          /* main(), before the game starts */
+double guest_peek_seconds(void); /* guest_seconds() without advancing the virtual clock */
+int on_game_thread(void);         /* the game's main thread (the one that runs WinMain) */
+/* sched.c (deterministic mode only; no-ops otherwise) */
+void sched_main_init(void);                       /* on the game's thread, before it starts */
+void *sched_new(const char *name, int (*start)(void *), void *arg);   /* by the creator; NULL when off */
+void sched_enter(void *rec);                      /* first thing on the new host thread */
+void sched_exit(void);
+void sched_yield_det(void);
+int sched_wait(int (*pred)(void *), void *arg, uint64_t deadline_us, uint64_t (*deadline_fn)(void));
+int sched_active(void);                           /* the calling thread is scheduled */
+uint64_t sched_now_us(void);
 
 #endif

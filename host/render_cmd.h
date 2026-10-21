@@ -57,9 +57,12 @@ typedef struct {
 } CmdDraw;
 
 /* RGBA8 levels follow: for each level, w*h*4 bytes */
-typedef struct { CmdHdr h; uint32_t id, levels, w[14], h_[14]; } CmdUploadTex;
+/* fmt: TEXFMT_RGBA8, or a BC format whose blocks follow as stored (DXT textures, when the GPU samples BC) */
+enum { TEXFMT_RGBA8 = 0, TEXFMT_BC1, TEXFMT_BC2, TEXFMT_BC3 };
+typedef struct { CmdHdr h; uint32_t id, levels, fmt, w[14], h_[14]; } CmdUploadTex;
+extern int g_gpu_bc;   /* the device can sample BC1-3 (set before the game draws) */
 typedef struct { CmdHdr h; uint32_t id; } CmdDestroy;
-/* RGBA8 data follows */
+/* level data follows: RGBA8 rows, or BC blocks (rows of (w+3)/4 blocks) */
 typedef struct { CmdHdr h; uint32_t id, w, h_; } CmdUploadSurf;
 
 /* Copies a render target (id 0: back buffer, scaled to w x h) into guest memory in format `fmt`,

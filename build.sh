@@ -11,7 +11,7 @@ EXE=${1:?usage: build.sh <game.exe> <functions.json>}
 FUNCS=${2:?usage: build.sh <game.exe> <functions.json>}
 PY=${PY:-python3}
 WGPU=${WGPU:-$R/third_party/wgpu}
-SDL2=${SDL2:-$(brew --prefix sdl2)}
+SDL2=${SDL2:-$(brew --prefix)}  # brew --prefix sdl2 now points at sdl2-compat
 PFLAG=; [ -n "$PROFILE" ] && PFLAG="-DRC_PROFILE=\"$(cd "$(dirname "$PROFILE")" && pwd)/$(basename "$PROFILE")\""
 OPT=${OPT:--O1}
 FPFLAGS="-frounding-math"  # the x87 rounding mode is mirrored into the host FPU at runtime
@@ -28,7 +28,7 @@ ls $OUT/*.c | while read f; do
     if [ ! -f "build/$OBJ/$b.o" ] || [ "$(cat "build/$OBJ/$b.hash" 2>/dev/null)" != "$h" ]; then
         echo "$f $b $h"
     fi
-done | xargs -P 10 -L 1 sh -c 'clang '"$OPT $FPFLAGS"' -w -c -Iruntime -I$OUT "$0" -o "build/$OBJ/$1.o" && echo "$2" > "build/$OBJ/$1.hash" && echo "  compiled $1"'
+done | xargs -r -P 10 -L 1 sh -c 'clang '"$OPT $FPFLAGS"' -w -c -Iruntime -I$OUT "$0" -o "build/$OBJ/$1.o" && echo "$2" > "build/$OBJ/$1.hash" && echo "  compiled $1"'
 for o in build/$OBJ/*.o; do  # drop objects whose source no longer exists
     [ -f "$OUT/$(basename "$o" .o).c" ] || rm -f "$o" "${o%.o}.hash"
 done

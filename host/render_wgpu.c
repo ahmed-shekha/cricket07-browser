@@ -140,7 +140,11 @@ static const char *WGSL_FF =
 
 /* ------------------------------------------------------------------ state */
 
-typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t used_in_batch, w, h, levels; } GTex;
+static void release_view(WGPUTextureView view);   /* drops cached bind groups using it, then releases it */
+
+typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t used_in_batch, w, h, levels, fmt; size_t bytes; } GTex;
+int g_gpu_bc;               /* device has texture-compression-bc */
+size_t g_gpu_tex_bytes;     /* GPU memory in game textures, for the [mem] log */
 typedef struct { WGPUTexture tex; WGPUTextureView view; uint32_t w, h; int depth, gpu_dirty; } GSurf;
 
 static WGPUInstance g_inst;
@@ -219,14 +223,14 @@ static void on_error(WGPUDevice const *d, WGPUErrorType t, WGPUStringView msg, v
 }
 
 static void make_depth(void) {
-    if (g_bb) { wgpuTextureViewRelease(g_bb_view); wgpuTextureRelease(g_bb); }
+    if (g_bb) { release_view(g_bb_view); wgpuTextureRelease(g_bb); }
     WGPUTextureDescriptor bd = WGPU_TEXTURE_DESCRIPTOR_INIT;
     bd.size = (WGPUExtent3D){ (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
     bd.format = g_surf_fmt;
     bd.usage = WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
     g_bb = wgpuDeviceCreateTexture(g_dev, &bd);
     g_bb_view = wgpuTextureCreateView(g_bb, NULL);
-    if (g_depth) { wgpuTextureViewRelease(g_depth_view); wgpuTextureRelease(g_depth); }
+    if (g_depth) { release_view(g_depth_view); wgpuTextureRelease(g_depth); }
     WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
     td.size = (WGPUExtent3D){ (uint32_t)g_surf_w, (uint32_t)g_surf_h, 1 };
     td.format = WGPUTextureFormat_Depth24PlusStencil8;
@@ -364,6 +368,10 @@ int gpu_init_native(void) {
 
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
+    static const WGPUFeatureName bc = WGPUFeatureName_TextureCompressionBC;
+    g_gpu_bc = wgpuAdapterHasFeature(g_adapter, bc) && !getenv("RC_NO_BC");   /* DXT textures stay compressed */
+    if (g_gpu_bc) { dd.requiredFeatureCount = 1; dd.requiredFeatures = &bc; }
+    fprintf(stderr, "[wgpu] BC texture compression: %s\n", g_gpu_bc ? "yes" : "no (DXT textures are converted to RGBA8)");
     WGPURequestDeviceCallbackInfo dci = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     dci.mode = WGPUCallbackMode_AllowProcessEvents;
     dci.callback = on_device;
@@ -453,6 +461,7 @@ static void capture_png(const char *path) {
     write_png(path, data, w, h, stride);
     fprintf(stderr, "[wgpu] screenshot %s\n", path);
     wgpuBufferUnmap(buf);
+    wgpuBufferDestroy(buf);
     wgpuBufferRelease(buf);
 }
 
@@ -600,6 +609,50 @@ static void end_pass(void) {
     if (g_pass) { wgpuRenderPassEncoderEnd(g_pass); wgpuRenderPassEncoderRelease(g_pass); g_pass = NULL; }
 }
 
+/* Textures the game freed. Releasing a WebGPU texture only drops a reference: its GPU memory goes when the
+   browser garbage-collects it, and screens that recreate textures every frame (team select) run the GPU out
+   of memory first (Firefox). destroy() frees it at once, but draws recorded into the open command encoder
+   may still use it, so the destroy waits until that work has been submitted. */
+/* Bind groups of draws, cached by their 4 texture views and 4 sampler keys. A WebGPU bind group can't be
+   destroyed, only dropped for the browser's garbage collector, and a new one per draw (hundreds a frame)
+   outran it on Firefox/D3D12, where they hold descriptor-heap slots: "Out of Memory", then invalid bind
+   groups. Entries using a view are dropped when that view is released (pointers can be reused). */
+#define BG_CACHE 4096
+#define BG_PROBES 8
+typedef struct { WGPUTextureView v[4]; uint32_t s[4]; WGPUBindGroup bg; uint32_t stamp; } BgEntry;
+static BgEntry g_bgc[BG_CACHE];
+static uint32_t g_bg_stamp;
+uint32_t g_gpu_bind_groups_made;   /* for the [mem] log */
+static uint32_t bg_hash(WGPUTextureView const v[4], const uint32_t s[4]) {
+    uint64_t h = 1469598103934665603ull;
+    for (int i = 0; i < 4; i++) { h = (h ^ (uint64_t)(uintptr_t)v[i]) * 1099511628211ull; h = (h ^ s[i]) * 1099511628211ull; }
+    return (uint32_t)(h ^ (h >> 32));
+}
+static void bg_forget_view(WGPUTextureView view) {
+    for (int i = 0; i < BG_CACHE; i++) {
+        BgEntry *e = &g_bgc[i];
+        if (e->bg && (e->v[0] == view || e->v[1] == view || e->v[2] == view || e->v[3] == view)) {
+            wgpuBindGroupRelease(e->bg);   /* recorded commands keep their own reference */
+            e->bg = NULL;
+        }
+    }
+}
+static void release_view(WGPUTextureView view) { bg_forget_view(view); wgpuTextureViewRelease(view); }
+
+static WGPUTexture *g_retired;
+static size_t g_nretired, g_capretired;
+static void retire_texture(WGPUTexture t) {
+    if (g_nretired == g_capretired) {
+        g_capretired = g_capretired ? g_capretired * 2 : 64;
+        g_retired = realloc(g_retired, g_capretired * sizeof *g_retired);
+    }
+    g_retired[g_nretired++] = t;
+}
+static void destroy_retired(void) {
+    for (size_t i = 0; i < g_nretired; i++) { wgpuTextureDestroy(g_retired[i]); wgpuTextureRelease(g_retired[i]); }
+    g_nretired = 0;
+}
+
 static void submit(void) {
     end_pass();
     if (g_enc) {
@@ -609,6 +662,7 @@ static void submit(void) {
         wgpuCommandEncoderRelease(g_enc);
         g_enc = NULL;
     }
+    destroy_retired();   /* nothing recorded can use them any more */
     g_vpos = g_upos = 0;
     g_batch++;
 }
@@ -774,19 +828,25 @@ static void finish_readback(const CmdReadback *c) {
 
 static void exec_upload_tex(const CmdUploadTex *c) {
     GTex *g = obj_get(c->id);
-    if (g && (g->w != c->w[0] || g->h != c->h_[0] || g->levels != c->levels)) {
-        wgpuTextureViewRelease(g->view); wgpuTextureRelease(g->tex); free(g); obj_del(c->id); g = NULL;
+    static const WGPUTextureFormat formats[4] = { WGPUTextureFormat_RGBA8Unorm, WGPUTextureFormat_BC1RGBAUnorm,
+                                                  WGPUTextureFormat_BC2RGBAUnorm, WGPUTextureFormat_BC3RGBAUnorm };
+    uint32_t bs = c->fmt == TEXFMT_BC1 ? 8 : 16;
+    if (g && (g->w != c->w[0] || g->h != c->h_[0] || g->levels != c->levels || g->fmt != c->fmt)) {
+        release_view(g->view); retire_texture(g->tex); g_gpu_tex_bytes -= g->bytes; free(g); obj_del(c->id); g = NULL;
     }
     if (!g) {
         g = calloc(1, sizeof *g);
         WGPUTextureDescriptor td = WGPU_TEXTURE_DESCRIPTOR_INIT;
         td.size = (WGPUExtent3D){ c->w[0], c->h_[0], 1 };
-        td.format = WGPUTextureFormat_RGBA8Unorm;
+        td.format = formats[c->fmt & 3];
         td.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
         td.mipLevelCount = c->levels;
         g->tex = wgpuDeviceCreateTexture(g_dev, &td);
         g->view = wgpuTextureCreateView(g->tex, NULL);
-        g->w = c->w[0]; g->h = c->h_[0]; g->levels = c->levels;
+        g->w = c->w[0]; g->h = c->h_[0]; g->levels = c->levels; g->fmt = c->fmt;
+        for (uint32_t l = 0; l < c->levels; l++)
+            g->bytes += c->fmt ? (size_t)((c->w[l] + 3) / 4) * ((c->h_[l] + 3) / 4) * bs : (size_t)c->w[l] * c->h_[l] * 4;
+        g_gpu_tex_bytes += g->bytes;
         obj_put(c->id, g);
     } else if (g->used_in_batch == g_batch) {
         /* already drawn with in the current batch: flush that work first, so the earlier draws see
@@ -799,9 +859,17 @@ static void exec_upload_tex(const CmdUploadTex *c) {
         WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         dst.texture = g->tex; dst.mipLevel = l;
         WGPUTexelCopyBufferLayout lay = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
-        lay.bytesPerRow = c->w[l] * 4; lay.rowsPerImage = c->h_[l];
         WGPUExtent3D ex = { c->w[l], c->h_[l], 1 };
-        size_t n = (size_t)c->w[l] * c->h_[l] * 4;
+        size_t n;
+        if (c->fmt) {   /* whole blocks: small mips are copied at their rounded-up (physical) size */
+            uint32_t bw = (c->w[l] + 3) / 4, bh = (c->h_[l] + 3) / 4;
+            lay.bytesPerRow = bw * bs; lay.rowsPerImage = bh;
+            ex = (WGPUExtent3D){ bw * 4, bh * 4, 1 };
+            n = (size_t)bw * bh * bs;
+        } else {
+            lay.bytesPerRow = c->w[l] * 4; lay.rowsPerImage = c->h_[l];
+            n = (size_t)c->w[l] * c->h_[l] * 4;
+        }
         wgpuQueueWriteTexture(g_queue, &dst, px, n, &lay, &ex);
         px += n;
     }
@@ -813,10 +881,11 @@ static void exec_destroy(uint32_t id, int surface) {
     if (surface) {
         GSurf *g = p;
         if (g->view == g_tgt_color || g->view == g_tgt_depth) use_backbuffer();
-        wgpuTextureViewRelease(g->view); wgpuTextureRelease(g->tex);
+        release_view(g->view); retire_texture(g->tex);
     } else {
         GTex *g = p;
-        wgpuTextureViewRelease(g->view); wgpuTextureRelease(g->tex);
+        release_view(g->view); retire_texture(g->tex);
+        g_gpu_tex_bytes -= g->bytes;
     }
     free(p);
     obj_del(id);
@@ -875,9 +944,25 @@ static void exec_draw(const CmdDraw *c) {
         te[2 * i + 1] = (WGPUBindGroupEntry)WGPU_BIND_GROUP_ENTRY_INIT;
         te[2 * i + 1].binding = (uint32_t)(2 * i + 1); te[2 * i + 1].sampler = sampler_for(c->samp_key[i]);
     }
-    WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    bgd.layout = g_bgl_t; bgd.entryCount = 8; bgd.entries = te;
-    WGPUBindGroup bg = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+    WGPUBindGroup bg = NULL;
+    uint32_t hsh = bg_hash(views, c->samp_key);
+    BgEntry *victim = NULL;
+    for (int p = 0; p < BG_PROBES && !bg; p++) {
+        BgEntry *e = &g_bgc[(hsh + (uint32_t)p) % BG_CACHE];
+        if (e->bg && !memcmp(e->v, views, sizeof e->v) && !memcmp(e->s, c->samp_key, sizeof e->s)) { bg = e->bg; e->stamp = ++g_bg_stamp; }
+        else if (!victim || !e->bg || (victim->bg && e->stamp < victim->stamp)) victim = e;
+    }
+    if (!bg) {
+        WGPUBindGroupDescriptor bgd = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+        bgd.layout = g_bgl_t; bgd.entryCount = 8; bgd.entries = te;
+        bg = wgpuDeviceCreateBindGroup(g_dev, &bgd);
+        g_gpu_bind_groups_made++;
+        if (victim->bg) wgpuBindGroupRelease(victim->bg);
+        memcpy(victim->v, views, sizeof victim->v);
+        memcpy(victim->s, c->samp_key, sizeof victim->s);
+        victim->bg = bg;
+        victim->stamp = ++g_bg_stamp;
+    }
 
     PKey k = c->key;
     if (!ps) k.ps = 0;
@@ -891,16 +976,15 @@ static void exec_draw(const CmdDraw *c) {
         if (vx + vw > g_tgt_w) vw = g_tgt_w - vx;
         if (vy + vh > g_tgt_h) vh = g_tgt_h - vy;
     }
-    if (vw <= 0 || vh <= 0) { wgpuBindGroupRelease(bg); return; }
+    if (vw <= 0 || vh <= 0) return;
     wgpuRenderPassEncoderSetViewport(g_pass, vx, vy, vw, vh, c->minz, c->maxz);
     wgpuRenderPassEncoderSetPipeline(g_pass, p);
     uint32_t off = g_upos;
     wgpuRenderPassEncoderSetBindGroup(g_pass, 0, g_bg_u, 1, &off);
-    wgpuRenderPassEncoderSetBindGroup(g_pass, 1, bg, 0, NULL);
+    wgpuRenderPassEncoderSetBindGroup(g_pass, 1, bg, 0, NULL);   /* owned by the cache */
     wgpuRenderPassEncoderSetVertexBuffer(g_pass, 0, g_vbuf, g_vpos, bytes);
     wgpuRenderPassEncoderDraw(g_pass, n, 1, 0, 0);
     if (g_tgt_gs) g_tgt_gs->gpu_dirty = 1;
-    wgpuBindGroupRelease(bg);
     g_vpos += (bytes + 255) & ~255u;
     g_upos += USTRIDE;
 #ifndef __EMSCRIPTEN__
@@ -1012,6 +1096,7 @@ void gpu_exec(const CmdHdr *h) {
             while (!g_map_done) wgpuInstanceProcessEvents(g_inst);
             store_pixels(c, wgpuBufferGetConstMappedRange(buf, 0, (uint64_t)stride * gh), gw, gh, stride);
             wgpuBufferUnmap(buf);
+            wgpuBufferDestroy(buf);   /* free the staging memory now, not at garbage collection */
             wgpuBufferRelease(buf);
         }
         finish_readback(c);
@@ -1054,6 +1139,7 @@ static void on_rb_mapped(WGPUMapAsyncStatus st, WGPUStringView msg, void *u1, vo
     if (st == WGPUMapAsyncStatus_Success)
         store_pixels(&g_rb_cmd, wgpuBufferGetConstMappedRange(g_rb_buf, 0, size), g_rb_gw, g_rb_gh, g_rb_stride);
     wgpuBufferUnmap(g_rb_buf);
+    wgpuBufferDestroy(g_rb_buf);
     wgpuBufferRelease(g_rb_buf);
     finish_readback(&g_rb_cmd);
     g_rb_pending = 0;
@@ -1125,12 +1211,23 @@ static void on_web_device(WGPURequestDeviceStatus st, WGPUDevice d, WGPUStringVi
     __atomic_store_n(&g_ready, 1, __ATOMIC_RELEASE);
 }
 
+static void request_web_adapter(int attempt);
 static void on_web_adapter(WGPURequestAdapterStatus st, WGPUAdapter a, WGPUStringView msg, void *u1, void *u2) {
-    (void)u1; (void)u2;
-    if (st != WGPURequestAdapterStatus_Success) { fprintf(stderr, "[wgpu] adapter: %.*s\n", (int)msg.length, msg.data); return; }
+    (void)u2;
+    int attempt = (int)(intptr_t)u1;
+    if (st != WGPURequestAdapterStatus_Success) {
+        fprintf(stderr, "[wgpu] adapter (attempt %d): %.*s\n", attempt, (int)msg.length, msg.data);
+        if (attempt < 2) request_web_adapter(attempt + 1);   /* default preference, then the software fallback */
+        return;
+    }
+    if (attempt == 2) fprintf(stderr, "[wgpu] using the browser's software (fallback) adapter: expect it to be slow\n");
     g_adapter = a;
     WGPUDeviceDescriptor dd = WGPU_DEVICE_DESCRIPTOR_INIT;
     dd.uncapturedErrorCallbackInfo.callback = on_error;
+    static const WGPUFeatureName bc = WGPUFeatureName_TextureCompressionBC;
+    g_gpu_bc = wgpuAdapterHasFeature(g_adapter, bc) && !getenv("RC_NO_BC");   /* DXT textures stay compressed */
+    if (g_gpu_bc) { dd.requiredFeatureCount = 1; dd.requiredFeatures = &bc; }
+    fprintf(stderr, "[wgpu] BC texture compression: %s\n", g_gpu_bc ? "yes" : "no (DXT textures are converted to RGBA8)");
     WGPURequestDeviceCallbackInfo dci = WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     dci.mode = WGPUCallbackMode_AllowSpontaneous;
     dci.callback = on_web_device;
@@ -1146,11 +1243,17 @@ EMSCRIPTEN_KEEPALIVE void rc_gpu_init(int w, int h) {
     WGPUSurfaceDescriptor sd = WGPU_SURFACE_DESCRIPTOR_INIT;
     sd.nextInChain = &cs.chain;
     g_surface = wgpuInstanceCreateSurface(g_inst, &sd);
+    request_web_adapter(0);
+}
+/* attempt 0: high-performance GPU; 1: any GPU; 2: the browser's software fallback adapter, if it has one */
+static void request_web_adapter(int attempt) {
     WGPURequestAdapterOptions ao = WGPU_REQUEST_ADAPTER_OPTIONS_INIT;
-    ao.powerPreference = WGPUPowerPreference_HighPerformance;
+    if (attempt == 0) ao.powerPreference = WGPUPowerPreference_HighPerformance;
+    if (attempt == 2) ao.forceFallbackAdapter = 1;
     WGPURequestAdapterCallbackInfo aci = WGPU_REQUEST_ADAPTER_CALLBACK_INFO_INIT;
     aci.mode = WGPUCallbackMode_AllowSpontaneous;
     aci.callback = on_web_adapter;
+    aci.userdata1 = (void *)(intptr_t)attempt;
     wgpuInstanceRequestAdapter(g_inst, &ao, aci);
 }
 #endif
